@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: huelma-lluvia-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+    runtime: python-3.12.3
