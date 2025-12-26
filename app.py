@@ -2,9 +2,10 @@ import os
 import io
 import re
 import logging
+import threading
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple
+from typing import Optional, List
 
 import requests
 import pdfplumber
@@ -28,15 +29,14 @@ logger = logging.getLogger(__name__)
 # ================== FLASK ==================
 app = Flask(__name__)
 
-# ================== TELEGRAM APP ==================
-tg_app: Optional[Application] = None
-tg_initialized = False
-
 # ================== REGEX ==================
-# Timestamp puede venir como 26/12/2025 12:36 o 10/12/25 18:00
 TS_RE = re.compile(r"\b(\d{2}/\d{2}/(\d{2}|\d{4}))\s+(\d{2}:\d{2})\b")
-# Fechas de cabecera tipo 09/12/25
 DATE_2Y_RE = re.compile(r"\b(\d{2}/\d{2}/\d{2})\b")
+
+# ================== TELEGRAM GLOBALS ==================
+tg_app: Optional[Application] = None
+tg_loop: Optional[asyncio.AbstractEventLoop] = None
+tg_thread_started = False
 
 
 # ================== UTILIDADES ==================
@@ -103,8 +103,8 @@ def extraer_linea_estacion(texto: str, key: str) -> Optional[str]:
 
 def extraer_fechas_cabecera_semanal(pdf_bytes: bytes, ts: Optional[str]) -> Optional[List[str]]:
     """
-    Extrae la cabecera del PDF semanal: "Día actual" + fechas dd/mm/yy.
-    Devuelve una lista en el orden que aparece en la tabla.
+    Cabecera tipo: "Día actual" + "09/12/25" "08/12/25" ...
+    Devuelve lista en orden de izquierda a derecha normalizada a dd/mm/yyyy.
     """
     fecha_actual = fecha_de_timestamp(ts)
 
@@ -120,7 +120,6 @@ def extraer_fechas_cabecera_semanal(pdf_bytes: bytes, ts: Optional[str]) -> Opti
         for row in t:
             if not row:
                 continue
-
             cells = [c.strip() for c in row if isinstance(c, str) and c.strip()]
             if not cells:
                 continue
@@ -140,7 +139,7 @@ def extraer_fechas_cabecera_semanal(pdf_bytes: bytes, ts: Optional[str]) -> Opti
             for f in fechas_2y:
                 out.append(normalizar_fecha_ddmmyy_a_ddmmyyyy(f))
 
-            # quitar duplicados manteniendo orden
+            # dedupe manteniendo orden
             seen = set()
             out2 = []
             for x in out:
@@ -148,10 +147,8 @@ def extraer_fechas_cabecera_semanal(pdf_bytes: bytes, ts: Optional[str]) -> Opti
                     seen.add(x)
                     out2.append(x)
 
-            logger.info("Cabecera semanal detectada (%d cols): %s", len(out2), out2)
             return out2
 
-    logger.warning("No encontré fila cabecera con 'Día actual' + fechas en tablas.")
     return None
 
 
@@ -187,14 +184,14 @@ def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]]
         return header + "\n\nNo encuentro la fila de *Huelma* en el PDF."
 
     valores = parsear_valores(linea)
-    if not valores:
-        return header + "\n\nHe encontrado la fila de Huelma, pero no he podido extraer valores numéricos."
+    if len(valores) < 7:
+        return header + "\n\nNo hay suficientes valores para mostrar la semana."
 
-    # Acumulados (asumiendo estructura actual)
+    # acumulados (estructura actual: últimos 2 números)
     mes_actual = valores[-2] if len(valores) >= 2 else None
     anio_hidrologico = valores[-1] if len(valores) >= 1 else None
 
-    # Número de columnas diarias
+    # cuántas columnas diarias según cabecera real
     if fechas_cols and len(fechas_cols) >= 2:
         n = len(fechas_cols)
     else:
@@ -202,22 +199,19 @@ def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]]
         n = 7
 
     if len(valores) < n:
-        return (
-            header
-            + f"\n\nNo hay suficientes valores diarios para emparejar ({len(valores)} valores, {n} días)."
-        )
+        return header + f"\n\nNo hay suficientes valores diarios ({len(valores)}) para {n} columnas del PDF."
 
     lluvias = valores[:n]
 
-    # Orden: más reciente arriba (como el PDF: Día actual, 09/12/25, 08/12/25...)
     msg = header + "\n"
     msg += "*Huelma – lluvia diaria (mm):*\n"
 
     if fechas_cols:
+        # cabecera ya viene con “más reciente -> más antiguo”
         for f, v in zip(fechas_cols, lluvias):
             msg += f"• {f}: *{v:.1f}* mm\n"
     else:
-        # fallback: estimación usando timestamp
+        # fallback
         end_date = datetime.strptime(fecha_de_timestamp(timestamp), "%d/%m/%Y").date()
         fechas_est = [(end_date - timedelta(days=i)).strftime("%d/%m/%Y") for i in range(0, n)]
         for f, v in zip(fechas_est, lluvias):
@@ -250,7 +244,7 @@ def obtener_semanal() -> str:
     return formatear_semanal(ts, fechas_cols, linea)
 
 
-# ================== TELEGRAM ==================
+# ================== TELEGRAM HANDLERS ==================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hola 👋\n"
@@ -265,7 +259,7 @@ async def hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_markdown(obtener_hoy())
     except Exception as e:
-        logger.exception("Error en /hoy: %s", e)
+        logger.exception("Error /hoy")
         await update.message.reply_text(f"Error en /hoy: {e}")
 
 
@@ -273,7 +267,7 @@ async def siete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_markdown(obtener_semanal())
     except Exception as e:
-        logger.exception("Error en /siete: %s", e)
+        logger.exception("Error /siete")
         await update.message.reply_text(f"Error en /siete: {e}")
 
 
@@ -281,15 +275,13 @@ async def huelma_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_markdown(obtener_hoy() + "\n\n" + obtener_semanal())
     except Exception as e:
-        logger.exception("Error en /huelma: %s", e)
+        logger.exception("Error /huelma")
         await update.message.reply_text(f"Error en /huelma: {e}")
 
 
-async def init_telegram_once():
-    global tg_app, tg_initialized
-    if tg_initialized:
-        return
-
+# ================== TELEGRAM LOOP THREAD ==================
+async def _tg_init_app():
+    global tg_app
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN no configurado")
 
@@ -300,7 +292,25 @@ async def init_telegram_once():
     tg_app.add_handler(CommandHandler("huelma", huelma_cmd))
 
     await tg_app.initialize()
-    tg_initialized = True
+    logger.info("Telegram Application inicializada (loop persistente).")
+
+
+def _tg_loop_runner():
+    global tg_loop
+    tg_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(tg_loop)
+    tg_loop.run_until_complete(_tg_init_app())
+    tg_loop.run_forever()
+
+
+def ensure_tg_thread():
+    global tg_thread_started
+    if tg_thread_started:
+        return
+    tg_thread_started = True
+    th = threading.Thread(target=_tg_loop_runner, daemon=True)
+    th.start()
+    logger.info("Hilo de loop Telegram arrancado.")
 
 
 # ================== FLASK ROUTES ==================
@@ -313,17 +323,22 @@ def index():
 @app.post("/webhook/")
 def webhook():
     try:
+        ensure_tg_thread()
+
         update_json = request.get_json(force=True)
+        if tg_loop is None or tg_app is None:
+            return "not ready", 503
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        loop.run_until_complete(init_telegram_once())
         update = Update.de_json(update_json, tg_app.bot)
-        loop.run_until_complete(tg_app.process_update(update))
 
-        loop.close()
+        # Enviar el procesamiento al loop persistente
+        fut = asyncio.run_coroutine_threadsafe(tg_app.process_update(update), tg_loop)
+        # Esperamos a que termine (con timeout para no colgar)
+        fut.result(timeout=20)
+
     except Exception:
         logger.exception("Error procesando update")
+        # devolvemos ok igualmente para que Telegram no reintente en bucle agresivo
+        return "ok", 200
 
     return "ok", 200
