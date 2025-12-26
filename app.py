@@ -4,15 +4,26 @@ import re
 import logging
 import threading
 import asyncio
-from datetime import datetime, timedelta
+import sqlite3
+from datetime import datetime, timedelta, time
 from typing import Optional, List
 
 import requests
 import pdfplumber
 from flask import Flask, request
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 
 # ================== CONFIG ==================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -21,6 +32,12 @@ URL_HOY = "https://www.chguadalquivir.es/saih/tmp/Lluvia_Hoy.pdf"
 URL_7DIAS = "https://www.chguadalquivir.es/saih/tmp/LLuvia_7d%C3%ADas.pdf"
 
 ESTACION_HUELMA_KEY = "Huelma"
+
+# Día/horario del envío semanal (Europa/Madrid aproximado)
+# (El JobQueue usa el timezone del runtime; si quieres precisión total, te lo adapto con pytz/zoneinfo)
+WEEKLY_SEND_DAY = 0  # 0=Lunes, 6=Domingo
+WEEKLY_SEND_HOUR = 9
+WEEKLY_SEND_MINUTE = 0
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +54,75 @@ DATE_2Y_RE = re.compile(r"\b(\d{2}/\d{2}/\d{2})\b")
 tg_app: Optional[Application] = None
 tg_loop: Optional[asyncio.AbstractEventLoop] = None
 tg_thread_started = False
+
+# ================== DB ==================
+DB_PATH = "bot_stats.sqlite"
+
+
+def db_connect():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def db_init():
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            username TEXT,
+            command TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS weekly_subscriptions (
+            chat_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL,
+            created_ts TEXT NOT NULL
+        )
+        """
+    )
+    con.commit()
+    con.close()
+
+
+def db_log_usage(chat_id: int, username: Optional[str], command: str):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO usage_events(ts, chat_id, username, command) VALUES (?, ?, ?, ?)",
+        (datetime.utcnow().isoformat(timespec="seconds"), chat_id, username, command),
+    )
+    con.commit()
+    con.close()
+
+
+def db_set_weekly_subscription(chat_id: int, enabled: bool):
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute(
+        """
+        INSERT INTO weekly_subscriptions(chat_id, enabled, created_ts)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET enabled=excluded.enabled
+        """,
+        (chat_id, 1 if enabled else 0, datetime.utcnow().isoformat(timespec="seconds")),
+    )
+    con.commit()
+    con.close()
+
+
+def db_get_weekly_subscribers() -> List[int]:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT chat_id FROM weekly_subscriptions WHERE enabled=1")
+    rows = cur.fetchall()
+    con.close()
+    return [int(r[0]) for r in rows]
 
 
 # ================== UTILIDADES ==================
@@ -104,7 +190,7 @@ def extraer_linea_estacion(texto: str, key: str) -> Optional[str]:
 def extraer_fechas_cabecera_semanal(pdf_bytes: bytes, ts: Optional[str]) -> Optional[List[str]]:
     """
     Cabecera tipo: "Día actual" + "09/12/25" "08/12/25" ...
-    Devuelve lista en orden de izquierda a derecha normalizada a dd/mm/yyyy.
+    Devuelve lista (dd/mm/yyyy) en el orden del PDF (normalmente más reciente -> más antiguo).
     """
     fecha_actual = fecha_de_timestamp(ts)
 
@@ -161,7 +247,7 @@ def formatear_hoy(timestamp: Optional[str], linea: Optional[str]) -> str:
         header += " (actualizado: no detectado)"
 
     if not linea:
-        return header + "\n\nParece que hoy no ha llovido en Huelma."
+        return header + "\n\nHoy no se han registrado precipitaciones en *Huelma*."
 
     valores = parsear_valores(linea)
     msg = header + "\n"
@@ -191,7 +277,7 @@ def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]]
     mes_actual = valores[-2] if len(valores) >= 2 else None
     anio_hidrologico = valores[-1] if len(valores) >= 1 else None
 
-    # cuántas columnas diarias según cabecera real
+    # columnas diarias según cabecera real
     if fechas_cols and len(fechas_cols) >= 2:
         n = len(fechas_cols)
     else:
@@ -203,15 +289,16 @@ def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]]
 
     lluvias = valores[:n]
 
+    # El PDF suele venir en orden "más reciente -> más antiguo".
+    # Tú quieres: más reciente arriba (perfecto, lo dejamos como viene).
     msg = header + "\n"
     msg += "*Huelma – lluvia diaria (mm):*\n"
 
     if fechas_cols:
-        # cabecera ya viene con “más reciente -> más antiguo”
         for f, v in zip(fechas_cols, lluvias):
             msg += f"• {f}: *{v:.1f}* mm\n"
     else:
-        # fallback
+        # fallback (estimación por timestamp)
         end_date = datetime.strptime(fecha_de_timestamp(timestamp), "%d/%m/%Y").date()
         fechas_est = [(end_date - timedelta(days=i)).strftime("%d/%m/%Y") for i in range(0, n)]
         for f, v in zip(fechas_est, lluvias):
@@ -244,53 +331,163 @@ def obtener_semanal() -> str:
     return formatear_semanal(ts, fechas_cols, linea)
 
 
+# ================== UI (BOTONES) ==================
+def keyboard_principal() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Hoy", callback_data="BTN_HOY"),
+                InlineKeyboardButton("Semanal", callback_data="BTN_SEMANAL"),
+            ],
+        ]
+    )
+
+
 # ================== TELEGRAM HANDLERS ==================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username if update.effective_user else None
+    db_log_usage(chat_id, username, "/start")
+
     await update.message.reply_text(
-        "Hola 👋\n"
-        "Soy un bot para proporcionarte los datos de lluvia en Huelma.\n\n"
-        "/hoy  → lluvia diaria\n"
-        "/siete → lluvia semanal\n"
+        "Hola 👋\n\nElige una opción:",
+        reply_markup=keyboard_principal(),
     )
 
 
 async def hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await update.message.reply_markdown(obtener_hoy())
-    except Exception as e:
-        logger.exception("Error /hoy")
-        await update.message.reply_text(f"Error en /hoy: {e}")
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username if update.effective_user else None
+    db_log_usage(chat_id, username, "/hoy")
+
+    await update.message.reply_markdown(obtener_hoy(), reply_markup=keyboard_principal())
 
 
 async def siete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username if update.effective_user else None
+    db_log_usage(chat_id, username, "/siete")
+
+    await update.message.reply_markdown(obtener_semanal(), reply_markup=keyboard_principal())
+
+
+async def buttons_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = query.message.chat_id
+    username = query.from_user.username if query.from_user else None
+
+    if query.data == "BTN_HOY":
+        db_log_usage(chat_id, username, "BTN_HOY")
+        await query.message.reply_markdown(obtener_hoy(), reply_markup=keyboard_principal())
+    elif query.data == "BTN_SEMANAL":
+        db_log_usage(chat_id, username, "BTN_SEMANAL")
+        await query.message.reply_markdown(obtener_semanal(), reply_markup=keyboard_principal())
+
+
+# ===== Suscripción semanal =====
+async def suscribir_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username if update.effective_user else None
+    db_log_usage(chat_id, username, "/suscribir")
+
+    db_set_weekly_subscription(chat_id, True)
+    await update.message.reply_text(
+        "✅ Suscripción semanal activada.\nTe enviaré el informe *Semanal* automáticamente.",
+        reply_markup=keyboard_principal(),
+        parse_mode="Markdown",
+    )
+
+
+async def cancelar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username if update.effective_user else None
+    db_log_usage(chat_id, username, "/cancelar")
+
+    db_set_weekly_subscription(chat_id, False)
+    await update.message.reply_text(
+        "🛑 Suscripción semanal desactivada.",
+        reply_markup=keyboard_principal(),
+    )
+
+
+# ===== Envío semanal (JobQueue) =====
+async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
+    # Nota: aquí no tenemos Update; enviamos a todos los suscriptores
+    subs = db_get_weekly_subscribers()
+    if not subs:
+        return
+
+    msg = obtener_semanal()
+    for chat_id in subs:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                parse_mode="Markdown",
+                reply_markup=keyboard_principal(),
+            )
+            db_log_usage(chat_id, None, "AUTO_WEEKLY")
+        except Exception:
+            logger.exception("No pude enviar semanal a chat_id=%s", chat_id)
+
+
+# ================== TELEGRAM INIT (loop persistente) ==================
+async def _tg_post_init(application: Application):
+    # Registrar comandos visibles en el menú de Telegram (/)
     try:
-        await update.message.reply_markdown(obtener_semanal())
-    except Exception as e:
-        logger.exception("Error /siete")
-        await update.message.reply_text(f"Error en /siete: {e}")
+        await application.bot.set_my_commands(
+            [
+                BotCommand("hoy", "Lluvia registrada hoy en Huelma"),
+                BotCommand("siete", "Lluvia semanal (por días)"),
+                BotCommand("suscribir", "Recibir el informe semanal automáticamente"),
+                BotCommand("cancelar", "Cancelar la suscripción semanal"),
+                BotCommand("start", "Mostrar botones"),
+            ]
+        )
+    except Exception:
+        logger.exception("No pude setear comandos del bot")
 
+    # Programar el envío semanal (JobQueue)
+    # Lo programamos con run_daily comprobando el día de la semana.
+    def _should_send_today() -> bool:
+        return datetime.now().weekday() == WEEKLY_SEND_DAY
 
-async def huelma_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def _weekly_wrapper(ctx: ContextTypes.DEFAULT_TYPE):
+        if _should_send_today():
+            await weekly_job(ctx)
+
     try:
-        await update.message.reply_markdown(obtener_hoy() + "\n\n" + obtener_semanal())
-    except Exception as e:
-        logger.exception("Error /huelma")
-        await update.message.reply_text(f"Error en /huelma: {e}")
+        application.job_queue.run_daily(
+            _weekly_wrapper,
+            time=time(WEEKLY_SEND_HOUR, WEEKLY_SEND_MINUTE),
+            name="weekly_subscriptions",
+        )
+    except Exception:
+        logger.exception("No pude programar el job semanal")
 
 
-# ================== TELEGRAM LOOP THREAD ==================
 async def _tg_init_app():
     global tg_app
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN no configurado")
 
+    db_init()
+
     tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     tg_app.add_handler(CommandHandler("start", start_cmd))
     tg_app.add_handler(CommandHandler("hoy", hoy_cmd))
     tg_app.add_handler(CommandHandler("siete", siete_cmd))
-    tg_app.add_handler(CommandHandler("huelma", huelma_cmd))
+    tg_app.add_handler(CommandHandler("suscribir", suscribir_cmd))
+    tg_app.add_handler(CommandHandler("cancelar", cancelar_cmd))
+    tg_app.add_handler(CallbackQueryHandler(buttons_cb))
 
     await tg_app.initialize()
+    await tg_app.start()  # importante para JobQueue y tareas internas
+    await _tg_post_init(tg_app)
+
     logger.info("Telegram Application inicializada (loop persistente).")
 
 
@@ -330,15 +527,11 @@ def webhook():
 
         update = Update.de_json(update_json, tg_app.bot)
 
-        # Enviar el procesamiento al loop persistente
         fut = asyncio.run_coroutine_threadsafe(tg_app.process_update(update), tg_loop)
-        # Esperamos a que termine (con timeout para no colgar)
         fut.result(timeout=20)
 
     except Exception:
         logger.exception("Error procesando update")
-        # devolvemos ok igualmente para que Telegram no reintente en bucle agresivo
         return "ok", 200
 
     return "ok", 200
-
