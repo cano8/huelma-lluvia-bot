@@ -6,7 +6,7 @@ import threading
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta, time
-from typing import Optional, List, Tuple
+from typing import Optional, List
 
 import requests
 import pdfplumber
@@ -17,7 +17,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================== CONFIG ==================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # opcional, pero recomendado para /stats
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # opcional
 ADMIN_CHAT_ID_INT = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID and ADMIN_CHAT_ID.isdigit() else None
 
 URL_HOY = "https://www.chguadalquivir.es/saih/tmp/Lluvia_Hoy.pdf"
@@ -25,8 +25,7 @@ URL_7DIAS = "https://www.chguadalquivir.es/saih/tmp/LLuvia_7d%C3%ADas.pdf"
 
 ESTACION_HUELMA_KEY = "Huelma"
 
-# Envío semanal automático
-# 0=Lunes ... 6=Domingo
+# Envío semanal automático (Domingo 20:00)
 WEEKLY_SEND_DAY = 6  # Domingo
 WEEKLY_SEND_HOUR = 20
 WEEKLY_SEND_MINUTE = 0
@@ -48,6 +47,7 @@ DATE_2Y_RE = re.compile(r"\b(\d{2}/\d{2}/\d{2})\b")
 tg_app: Optional[Application] = None
 tg_loop: Optional[asyncio.AbstractEventLoop] = None
 tg_thread_started = False
+tg_ready = False
 
 # ================== DB ==================
 DB_PATH = "bot_stats.sqlite"
@@ -129,17 +129,11 @@ def db_is_subscribed(chat_id: int) -> bool:
 
 
 def db_stats_summary(days: int = 30) -> dict:
-    """
-    Devuelve estadísticas básicas de uso en los últimos `days` días.
-    """
     con = db_connect()
     cur = con.cursor()
 
     since = (datetime.utcnow() - timedelta(days=days)).isoformat(timespec="seconds")
-    cur.execute(
-        "SELECT COUNT(*) FROM usage_events WHERE ts >= ?",
-        (since,),
-    )
+    cur.execute("SELECT COUNT(*) FROM usage_events WHERE ts >= ?", (since,))
     total = int(cur.fetchone()[0])
 
     cur.execute(
@@ -158,14 +152,7 @@ def db_stats_summary(days: int = 30) -> dict:
     subs = int(cur.fetchone()[0])
 
     con.close()
-
-    return {
-        "since": since,
-        "total": total,
-        "by_cmd": by_cmd,
-        "subs": subs,
-        "days": days,
-    }
+    return {"total": total, "by_cmd": by_cmd, "subs": subs, "days": days}
 
 
 # ================== UTILIDADES ==================
@@ -212,21 +199,12 @@ def fecha_de_timestamp(ts: Optional[str]) -> str:
 
 
 def proximo_envio_semanal_utc(now_utc: Optional[datetime] = None) -> datetime:
-    """
-    Calcula el próximo envío en UTC usando weekday() y hora configurada.
-    Nota: esto es UTC (Render suele ir en UTC). Si quisieras Madrid exacto,
-    se puede añadir zoneinfo.
-    """
     now = now_utc or datetime.utcnow()
-
     target = now.replace(hour=WEEKLY_SEND_HOUR, minute=WEEKLY_SEND_MINUTE, second=0, microsecond=0)
-
     days_ahead = (WEEKLY_SEND_DAY - target.weekday()) % 7
     candidate = target + timedelta(days=days_ahead)
-
     if candidate <= now:
         candidate += timedelta(days=7)
-
     return candidate
 
 
@@ -251,7 +229,6 @@ def extraer_linea_estacion(texto: str, key: str) -> Optional[str]:
 
 def extraer_fechas_cabecera_semanal(pdf_bytes: bytes, ts: Optional[str]) -> Optional[List[str]]:
     fecha_actual = fecha_de_timestamp(ts)
-
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             page0 = pdf.pages[0]
@@ -283,7 +260,7 @@ def extraer_fechas_cabecera_semanal(pdf_bytes: bytes, ts: Optional[str]) -> Opti
             for f in fechas_2y:
                 out.append(normalizar_fecha_ddmmyy_a_ddmmyyyy(f))
 
-            # dedupe manteniendo orden
+            # dedupe
             seen = set()
             out2 = []
             for x in out:
@@ -299,30 +276,20 @@ def extraer_fechas_cabecera_semanal(pdf_bytes: bytes, ts: Optional[str]) -> Opti
 # ================== FORMATEO ==================
 def formatear_hoy(timestamp: Optional[str], linea: Optional[str]) -> str:
     header = "📄 *Lluvia diaria*"
-    if timestamp:
-        header += f" (actualizado: {timestamp})"
-    else:
-        header += " (actualizado: no detectado)"
+    header += f" (actualizado: {timestamp})" if timestamp else " (actualizado: no detectado)"
 
     if not linea:
         return header + "\n\nNo se han registrado precipitaciones en *Huelma* hoy."
 
     valores = parsear_valores(linea)
-    msg = header + "\n"
-    msg += "*Huelma*:\n"
-    if valores:
-        msg += "Valores detectados (mm): " + ", ".join(f"{v:.1f}" for v in valores)
-    else:
-        msg += "He encontrado la fila, pero no he podido extraer valores numéricos."
+    msg = header + "\n*Huelma*:\n"
+    msg += "Valores detectados (mm): " + ", ".join(f"{v:.1f}" for v in valores) if valores else "No pude extraer valores."
     return msg
 
 
 def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]], linea: Optional[str]) -> str:
     header = "📄 *Lluvia semanal*"
-    if timestamp:
-        header += f" (actualizado: {timestamp})"
-    else:
-        header += " (actualizado: no detectado)"
+    header += f" (actualizado: {timestamp})" if timestamp else " (actualizado: no detectado)"
 
     if not linea:
         return header + "\n\nNo encuentro la fila de *Huelma* en el PDF."
@@ -341,13 +308,11 @@ def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]]
         n = 7
 
     if len(valores) < n:
-        return header + f"\n\nNo hay suficientes valores diarios ({len(valores)}) para {n} columnas del PDF."
+        return header + f"\n\nNo hay suficientes valores diarios ({len(valores)}) para {n} columnas."
 
     lluvias = valores[:n]
 
-    msg = header + "\n"
-    msg += "*Huelma – lluvia diaria (mm):*\n"
-
+    msg = header + "\n*Huelma – lluvia diaria (mm):*\n"
     if fechas_cols:
         for f, v in zip(fechas_cols, lluvias):
             msg += f"• {f}: *{v:.1f}* mm\n"
@@ -366,7 +331,6 @@ def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]]
     return msg.strip()
 
 
-# ================== OBTENCIÓN ==================
 def obtener_hoy() -> str:
     pdf = descargar_pdf(URL_HOY)
     texto = extraer_texto_pdf(pdf)
@@ -384,7 +348,7 @@ def obtener_semanal() -> str:
     return formatear_semanal(ts, fechas_cols, linea)
 
 
-# ================== TELEGRAM HANDLERS ==================
+# ================== TELEGRAM COMMANDS ==================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     username = update.effective_user.username if update.effective_user else None
@@ -397,7 +361,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/siete → lluvia semanal\n"
         f"/suscribir → recibir *Lluvia semanal* cada {WEEKLY_SEND_DAY_NAME} a las {WEEKLY_SEND_TIME_STR}\n"
         "/cancelar → cancelar suscripción\n"
-        "/estado → ver estado de suscripción",
+        "/estado → ver estado de suscripción\n"
+        "/chatid → ver tu chat_id (para configurar admin)",
         parse_mode="Markdown",
     )
 
@@ -420,7 +385,6 @@ async def suscribir_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     username = update.effective_user.username if update.effective_user else None
     db_log_usage(chat_id, username, "/suscribir")
-
     db_set_weekly_subscription(chat_id, True)
     await update.message.reply_text(
         f"✅ Suscripción semanal activada.\nTe enviaré *Lluvia semanal* cada {WEEKLY_SEND_DAY_NAME} a las {WEEKLY_SEND_TIME_STR}.",
@@ -432,7 +396,6 @@ async def cancelar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     username = update.effective_user.username if update.effective_user else None
     db_log_usage(chat_id, username, "/cancelar")
-
     db_set_weekly_subscription(chat_id, False)
     await update.message.reply_text("🛑 Suscripción semanal desactivada.")
 
@@ -453,6 +416,13 @@ async def estado_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Próximo envío (UTC): {proximo.strftime('%d/%m/%Y %H:%M')}",
         parse_mode="Markdown",
     )
+
+
+async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username if update.effective_user else None
+    db_log_usage(chat_id, username, "/chatid")
+    await update.message.reply_text(f"Tu chat_id es: {chat_id}")
 
 
 def _is_admin(chat_id: int) -> bool:
@@ -482,12 +452,11 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-# ================== JOB SEMANAL ==================
+# ================== WEEKLY JOB (opcional) ==================
 async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
     subs = db_get_weekly_subscribers()
     if not subs:
         return
-
     msg = obtener_semanal()
     for chat_id in subs:
         try:
@@ -499,6 +468,7 @@ async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ================== TELEGRAM INIT (loop persistente) ==================
 async def _tg_post_init(application: Application):
+    # Menú de comandos
     await application.bot.set_my_commands(
         [
             BotCommand("hoy", "Lluvia registrada hoy en Huelma"),
@@ -506,16 +476,19 @@ async def _tg_post_init(application: Application):
             BotCommand("suscribir", f"Recibir la lluvia semanal cada {WEEKLY_SEND_DAY_NAME}"),
             BotCommand("cancelar", "Cancelar la suscripción semanal"),
             BotCommand("estado", "Ver estado de la suscripción"),
+            BotCommand("chatid", "Ver tu chat_id"),
             BotCommand("start", "Ver ayuda"),
         ]
     )
 
-    # job diario que solo envía si hoy es el día configurado
-    def _is_send_day() -> bool:
-        return datetime.utcnow().weekday() == WEEKLY_SEND_DAY
+    # JobQueue puede NO estar disponible: no rompemos el bot si falta
+    if application.job_queue is None:
+        logger.warning("JobQueue no disponible. El bot funcionará, pero no enviará mensajes automáticos.")
+        return
 
     async def _weekly_wrapper(ctx: ContextTypes.DEFAULT_TYPE):
-        if _is_send_day():
+        # Comprobamos día en UTC (si quieres Madrid exacto, lo ajusto con zoneinfo)
+        if datetime.utcnow().weekday() == WEEKLY_SEND_DAY:
             await weekly_job(ctx)
 
     application.job_queue.run_daily(
@@ -523,10 +496,11 @@ async def _tg_post_init(application: Application):
         time=time(WEEKLY_SEND_HOUR, WEEKLY_SEND_MINUTE),
         name="weekly_subscriptions",
     )
+    logger.info("Job semanal programado.")
 
 
 async def _tg_init_app():
-    global tg_app
+    global tg_app, tg_ready
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN no configurado")
 
@@ -540,21 +514,27 @@ async def _tg_init_app():
     tg_app.add_handler(CommandHandler("suscribir", suscribir_cmd))
     tg_app.add_handler(CommandHandler("cancelar", cancelar_cmd))
     tg_app.add_handler(CommandHandler("estado", estado_cmd))
+    tg_app.add_handler(CommandHandler("chatid", chatid_cmd))
     tg_app.add_handler(CommandHandler("stats", stats_cmd))
 
     await tg_app.initialize()
-    await tg_app.start()
+    await tg_app.start()  # mantiene tareas internas si existen
     await _tg_post_init(tg_app)
 
-    logger.info("Telegram Application inicializada (loop persistente).")
+    tg_ready = True
+    logger.info("Telegram Application lista (ready=True).")
 
 
 def _tg_loop_runner():
-    global tg_loop
-    tg_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(tg_loop)
-    tg_loop.run_until_complete(_tg_init_app())
-    tg_loop.run_forever()
+    global tg_loop, tg_ready
+    try:
+        tg_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(tg_loop)
+        tg_loop.run_until_complete(_tg_init_app())
+        tg_loop.run_forever()
+    except Exception:
+        tg_ready = False
+        logger.exception("Fallo arrancando el loop de Telegram (el bot no quedará listo).")
 
 
 def ensure_tg_thread():
@@ -579,11 +559,12 @@ def webhook():
     try:
         ensure_tg_thread()
 
-        update_json = request.get_json(force=True)
-        if tg_loop is None or tg_app is None:
+        if tg_loop is None or tg_app is None or not tg_ready:
             return "not ready", 503
 
+        update_json = request.get_json(force=True)
         update = Update.de_json(update_json, tg_app.bot)
+
         fut = asyncio.run_coroutine_threadsafe(tg_app.process_update(update), tg_loop)
         fut.result(timeout=20)
 
