@@ -197,7 +197,8 @@ def obtener_7dias() -> str:
     texto = extraer_texto_pdf(pdf)
     ts, fechas = extraer_metadata(texto)
     linea = extraer_linea_estacion(texto, ESTACION_HUELMA_KEY)
-    return formatear_7dias(ts, fechas, linea)
+    return formatear_7dias(ts, fechas, linea, texto)
+
 
 
 # ================== TELEGRAM COMMANDS ==================
@@ -292,4 +293,5 @@ def webhook():
         logger.exception("Error procesando update")
 
     return "ok", 200
+
 
