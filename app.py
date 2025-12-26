@@ -161,7 +161,7 @@ def formatear_hoy(timestamp: Optional[str], linea: Optional[str]) -> str:
         header += " (actualizado: no detectado)"
 
     if not linea:
-        return header + "\n\nParece que no ha llovido nada en *Huelma* hoy."
+        return header + "\n\nParece que hoy no ha llovido en Huelma."
 
     valores = parsear_valores(linea)
     msg = header + "\n"
@@ -248,10 +248,9 @@ def obtener_semanal() -> str:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hola 👋\n"
-        "Datos de lluvia en Huelma.\n\n"
+        "Soy un bot para proporcionarte los datos de lluvia en Huelma.\n\n"
         "/hoy  → lluvia diaria\n"
         "/siete → lluvia semanal\n"
-        "/huelma → ambas"
     )
 
 
@@ -342,3 +341,4 @@ def webhook():
         return "ok", 200
 
     return "ok", 200
+
