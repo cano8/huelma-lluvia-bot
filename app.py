@@ -33,22 +33,14 @@ tg_app: Optional[Application] = None
 tg_initialized = False
 
 # ================== REGEX ==================
-DATE_RE = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
 TS_RE = re.compile(r"(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})")
 
 
 # ================== UTILIDADES ==================
-def _unique_keep_order(items: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
-def extraer_metadata(texto: str) -> Optional[str]:
+def extraer_timestamp(texto: str) -> Optional[str]:
+    """
+    Devuelve 'dd/mm/yyyy hh:mm' si encuentra algo así en el texto del PDF.
+    """
     m = TS_RE.search(texto)
     if m:
         return f"{m.group(1)} {m.group(2)}"
@@ -56,6 +48,10 @@ def extraer_metadata(texto: str) -> Optional[str]:
 
 
 def fechas_ultimos_7_dias_desde_timestamp(ts: Optional[str]) -> List[str]:
+    """
+    Genera 7 fechas (dd/mm/yyyy) desde el día del timestamp (incluido),
+    yendo hacia atrás 6 días: D-6 ... D
+    """
     if ts:
         try:
             end_date = datetime.strptime(ts.split()[0], "%d/%m/%Y").date()
@@ -103,23 +99,30 @@ def extraer_linea_estacion(texto: str, key: str) -> Optional[str]:
 
 # ================== FORMATEO ==================
 def formatear_hoy(timestamp: Optional[str], linea: Optional[str]) -> str:
-    header = "📄 *Lluvia_Hoy*"
+    header = "📄 *Lluvia diaria*"
     if timestamp:
         header += f" (actualizado: {timestamp})"
 
+    # Si no aparece Huelma, interpretamos: no hay datos -> parece que no ha llovido
     if not linea:
-        return header + "\n\nNo encuentro datos de lluvia de hoy en *Huelma*."
+        return header + "\n\nParece que no ha llovido nada en *Huelma* hoy."
 
     valores = parsear_valores(linea)
     msg = header + "\n"
-    msg += f"*Huelma*:\n`{linea}`\n"
+    msg += "*Huelma*:\n"
+
+    # Si quieres mostrar SOLO un número final, habría que saber qué columna es "hoy".
+    # Por ahora mantenemos la extracción numérica.
     if valores:
-        msg += "\nValores detectados (mm): " + ", ".join(f"{v:.1f}" for v in valores)
+        msg += "Valores detectados (mm): " + ", ".join(f"{v:.1f}" for v in valores)
+    else:
+        msg += "He encontrado la fila, pero no he podido extraer valores numéricos."
+
     return msg
 
 
-def formatear_7dias(timestamp: Optional[str], linea: Optional[str]) -> str:
-    header = "📄 *Lluvia_7días*"
+def formatear_semanal(timestamp: Optional[str], linea: Optional[str]) -> str:
+    header = "📄 *Lluvia semanal*"
     if timestamp:
         header += f" (actualizado: {timestamp})"
 
@@ -127,13 +130,16 @@ def formatear_7dias(timestamp: Optional[str], linea: Optional[str]) -> str:
         return header + "\n\nNo encuentro la fila de *Huelma* en el PDF."
 
     valores = parsear_valores(linea)
-
     if len(valores) < 7:
-        return header + "\n\nNo hay suficientes valores diarios."
+        return header + "\n\nNo hay suficientes valores diarios para formar la semana."
 
-    # 7 días
+    # 7 días: por estructura actual, los 7 primeros son los diarios
     lluvias_7 = valores[:7]
     fechas_7 = fechas_ultimos_7_dias_desde_timestamp(timestamp)
+
+    # Queremos más reciente arriba -> invertimos
+    fechas_7_desc = list(reversed(fechas_7))
+    lluvias_7_desc = list(reversed(lluvias_7))
 
     # Acumulados
     mes_actual = valores[-2] if len(valores) >= 2 else None
@@ -141,7 +147,7 @@ def formatear_7dias(timestamp: Optional[str], linea: Optional[str]) -> str:
 
     msg = header + "\n"
     msg += "*Huelma – lluvia diaria (mm):*\n"
-    for f, v in zip(fechas_7, lluvias_7):
+    for f, v in zip(fechas_7_desc, lluvias_7_desc):
         msg += f"• {f}: *{v:.1f}* mm\n"
 
     msg += "\n*Acumulados:*\n"
@@ -157,17 +163,17 @@ def formatear_7dias(timestamp: Optional[str], linea: Optional[str]) -> str:
 def obtener_hoy() -> str:
     pdf = descargar_pdf(URL_HOY)
     texto = extraer_texto_pdf(pdf)
-    ts = extraer_metadata(texto)
+    ts = extraer_timestamp(texto)
     linea = extraer_linea_estacion(texto, ESTACION_HUELMA_KEY)
     return formatear_hoy(ts, linea)
 
 
-def obtener_7dias() -> str:
+def obtener_semanal() -> str:
     pdf = descargar_pdf(URL_7DIAS)
     texto = extraer_texto_pdf(pdf)
-    ts = extraer_metadata(texto)
+    ts = extraer_timestamp(texto)
     linea = extraer_linea_estacion(texto, ESTACION_HUELMA_KEY)
-    return formatear_7dias(ts, linea)
+    return formatear_semanal(ts, linea)
 
 
 # ================== TELEGRAM ==================
@@ -175,9 +181,9 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hola 👋\n"
         "Datos de lluvia en Huelma.\n\n"
-        "/hoy\n"
-        "/siete\n"
-        "/huelma"
+        "/hoy  → lluvia diaria\n"
+        "/siete → lluvia semanal\n"
+        "/huelma → ambas"
     )
 
 
@@ -186,12 +192,12 @@ async def hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def siete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_markdown(obtener_7dias())
+    await update.message.reply_markdown(obtener_semanal())
 
 
 async def huelma_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_markdown(
-        obtener_hoy() + "\n\n" + obtener_7dias()
+        obtener_hoy() + "\n\n" + obtener_semanal()
     )
 
 
