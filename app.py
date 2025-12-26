@@ -367,7 +367,7 @@ def obtener_semanal() -> str:
 # ================== TELEGRAM HANDLERS ==================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Start robusto: contesta incluso si update.message es None.
+    Start robusto: sin Markdown para evitar errores de parseo.
     """
     try:
         chat_id = update.effective_chat.id
@@ -380,7 +380,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Datos de lluvia en Huelma.\n\n"
             "/hoy  → lluvia diaria\n"
             "/semanal → lluvia semanal\n"
-            f"/suscribir → recibir *Lluvia semanal* cada {WEEKLY_SEND_DAY_NAME} a las {WEEKLY_SEND_TIME_STR}\n"
+            f"/suscribir → recibir Lluvia semanal cada {WEEKLY_SEND_DAY_NAME} a las {WEEKLY_SEND_TIME_STR}\n"
             "/cancelar → cancelar suscripción\n"
             "/estado → ver estado de suscripción\n"
             "/chatid → ver tu chat_id (para admin)\n"
@@ -389,18 +389,18 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         msg = update.effective_message
         if msg:
-            await msg.reply_text(text, parse_mode="Markdown")
+            await msg.reply_text(text)
         else:
-            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=chat_id, text=text)
 
     except Exception as e:
         logger.exception("Error en /start: %s", e)
-        # último intento de respuesta
         try:
             if update.effective_chat:
                 await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Error en /start: {e}")
         except Exception:
             pass
+
 
 
 async def hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -620,3 +620,4 @@ def webhook():
         return "ok", 200
 
     return "ok", 200
+
