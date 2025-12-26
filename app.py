@@ -49,21 +49,29 @@ def _unique_keep_order(items: List[str]) -> List[str]:
     return out
 
 
+# detecta “actualizado: dd/mm/yyyy hh:mm” aunque venga con otras palabras
+TS_STRICT_RE = re.compile(r"(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})")
+TS_WORD_RE = re.compile(r"(actualizad[oa].*?)(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})", re.IGNORECASE)
+
 def extraer_metadata(texto: str) -> Tuple[Optional[str], List[str]]:
     """
-    Devuelve:
-      - timestamp (str) si encuentra algo tipo 'dd/mm/yyyy hh:mm'
-      - lista de fechas 'dd/mm/yyyy' únicas en orden de aparición
+    - timestamp: 'dd/mm/yyyy hh:mm' si aparece (busca patrones típicos del PDF)
+    - fechas: lista de 'dd/mm/yyyy' en orden (útil para columnas de 7 días)
     """
     ts = None
-    m = DATETIME_RE.search(texto)
+
+    m = TS_WORD_RE.search(texto)
     if m:
-        ts = f"{m.group(1)} {m.group(2)}"
+        ts = f"{m.group(2)} {m.group(3)}"
+    else:
+        m2 = TS_STRICT_RE.search(texto)
+        if m2:
+            ts = f"{m2.group(1)} {m2.group(2)}"
 
     fechas = DATE_RE.findall(texto)
     fechas = _unique_keep_order(fechas)
-
     return ts, fechas
+
 
 
 def parsear_valores(linea: str) -> List[float]:
@@ -126,44 +134,53 @@ def formatear_hoy(timestamp: Optional[str], linea: Optional[str]) -> str:
     return msg
 
 
-def formatear_7dias(timestamp: Optional[str], fechas: List[str], linea: Optional[str]) -> str:
-    if not linea:
-        header = "📄 *Lluvia_7días*"
-        if timestamp:
-            header += f" (actualizado: {timestamp})"
-        return header + "\n\nNo encuentro la fila de *Huelma* en el PDF."
-
-    valores = parsear_valores(linea)
-
+def formatear_7dias(timestamp: Optional[str], fechas: List[str], linea: Optional[str], texto_pdf: str) -> str:
     header = "📄 *Lluvia_7días*"
     if timestamp:
         header += f" (actualizado: {timestamp})"
 
-    msg = header + "\n"
-    msg += f"*Huelma*:\n`{linea}`\n"
+    if not linea:
+        return header + "\n\nNo encuentro la fila de *Huelma* en el PDF."
 
-    # --- Emparejar días con valores ---
-    # En muchos PDFs de 7 días, el encabezado tiene 7 fechas y la fila tiene 7 valores (a veces + totales).
-    # Estrategia robusta:
-    # - Si encontramos >= 7 fechas en el PDF, nos quedamos con las 7 primeras (o las últimas, depende del formato).
-    # - Si hay más valores que fechas, cogemos los últimos N valores (suele incluir totales al final o al principio).
-    # Como no tenemos aquí el formato exacto de tu PDF, hacemos un emparejamiento prudente:
-    #   - Tomamos las ÚLTIMAS 7 fechas encontradas (normalmente el tramo "últimos 7 días").
-    #   - Tomamos las ÚLTIMAS 7 lluvias de la línea (ignorando posibles acumulados finales).
-    fechas_7 = fechas[-7:] if len(fechas) >= 7 else fechas
+    valores = parsear_valores(linea)
 
-    if len(fechas_7) >= 7 and len(valores) >= 7:
-        lluvias_7 = valores[-7:]
-        msg += "\nLluvia por día (mm):\n"
-        for f, v in zip(fechas_7, lluvias_7):
-            msg += f"• {f}: {v:.1f} mm\n"
+    # Intento 1 (preferido): fechas de la cabecera del PDF (suelen estar al principio)
+    primeras_lineas = "\n".join(texto_pdf.splitlines()[:60])
+    fechas_head = _unique_keep_order(DATE_RE.findall(primeras_lineas))
+
+    # Nos quedamos con 7 fechas si existen
+    if len(fechas_head) >= 7:
+        fechas_7 = fechas_head[-7:]
+    else:
+        # Intento 2: usar las fechas encontradas en todo el PDF
+        fechas_7 = fechas[-7:] if len(fechas) >= 7 else []
+
+    # Emparejado: si tenemos 7 fechas y al menos 7 valores, mostramos el desglose diario
+    # (Tomamos los 7 primeros valores como días, que es el formato típico de estas tablas)
+    if len(fechas_7) == 7 and len(valores) >= 7:
+        lluvias_dia = valores[:7]
+
+        msg = header + "\n"
+        msg += "*Huelma – lluvia por día (mm):*\n"
+        for f, v in zip(fechas_7, lluvias_dia):
+            msg += f"• {f}: *{v:.1f}* mm\n"
+
+        # Si hay más valores, los mostramos como “extra” sin ensuciar
+        extras = valores[7:]
+        if extras:
+            msg += "\n_Otros acumulados que aparecen en la fila (por si te interesan):_\n"
+            msg += ", ".join(f"{x:.1f}" for x in extras)
+
         return msg.strip()
 
-    # Si no conseguimos 7 fechas, devolvemos al menos timestamp + los valores detectados
+    # Si no podemos sacar fechas (raro), devolvemos algo limpio igualmente
+    msg = header + "\n"
+    msg += "*Huelma:*\n"
+    msg += "No he podido leer las fechas de los 7 días desde la cabecera del PDF.\n"
     if valores:
-        msg += "\nValores numéricos detectados (mm):\n" + ", ".join(f"{v:.1f}" for v in valores)
-
+        msg += "Valores numéricos detectados (mm): " + ", ".join(f"{v:.1f}" for v in valores)
     return msg
+
 
 
 # ================== OBTENER DATOS ==================
@@ -275,3 +292,4 @@ def webhook():
         logger.exception("Error procesando update")
 
     return "ok", 200
+
