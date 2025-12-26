@@ -377,14 +377,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = (
             "Hola 👋\n"
-            "Datos de lluvia en Huelma.\n\n"
-            "/hoy  → lluvia diaria\n"
+            "Te muestro los datos de lluvia en Huelma. Estos datos se extraen de la Confederación Hidrográfica del Guadalquivir (CHG). Los comandos disponibles son los siguientes:\n\n"
+            "/hoy  → lluvia hoy\n"
             "/semanal → lluvia semanal\n"
-            f"/suscribir → recibir Lluvia semanal cada {WEEKLY_SEND_DAY_NAME} a las {WEEKLY_SEND_TIME_STR}\n"
+            f"/suscribir → recibir datos de lluvia semanal cada {WEEKLY_SEND_DAY_NAME} a las {WEEKLY_SEND_TIME_STR}\n"
             "/cancelar → cancelar suscripción\n"
-            "/estado → ver estado de suscripción\n"
-            "/chatid → ver tu chat_id (para admin)\n"
-            "/stats → (admin) ver estadísticas"
+            "/estado → ver estado de suscripción"
         )
 
         msg = update.effective_message
@@ -620,4 +618,5 @@ def webhook():
         return "ok", 200
 
     return "ok", 200
+
 
