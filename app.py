@@ -6,38 +6,32 @@ import threading
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta, time
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import requests
 import pdfplumber
 from flask import Flask, request
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    BotCommand,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler,
-)
+from telegram import Update, BotCommand
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================== CONFIG ==================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # opcional, pero recomendado para /stats
+ADMIN_CHAT_ID_INT = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID and ADMIN_CHAT_ID.isdigit() else None
 
 URL_HOY = "https://www.chguadalquivir.es/saih/tmp/Lluvia_Hoy.pdf"
 URL_7DIAS = "https://www.chguadalquivir.es/saih/tmp/LLuvia_7d%C3%ADas.pdf"
 
 ESTACION_HUELMA_KEY = "Huelma"
 
-# Día/horario del envío semanal (Europa/Madrid aproximado)
-# (El JobQueue usa el timezone del runtime; si quieres precisión total, te lo adapto con pytz/zoneinfo)
-WEEKLY_SEND_DAY = 0  # 0=Lunes, 6=Domingo
-WEEKLY_SEND_HOUR = 9
+# Envío semanal automático
+# 0=Lunes ... 6=Domingo
+WEEKLY_SEND_DAY = 6  # Domingo
+WEEKLY_SEND_HOUR = 20
 WEEKLY_SEND_MINUTE = 0
+WEEKLY_SEND_DAY_NAME = "domingo"
+WEEKLY_SEND_TIME_STR = f"{WEEKLY_SEND_HOUR:02d}:{WEEKLY_SEND_MINUTE:02d}"
 
 # ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO)
@@ -125,6 +119,55 @@ def db_get_weekly_subscribers() -> List[int]:
     return [int(r[0]) for r in rows]
 
 
+def db_is_subscribed(chat_id: int) -> bool:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("SELECT enabled FROM weekly_subscriptions WHERE chat_id=?", (chat_id,))
+    row = cur.fetchone()
+    con.close()
+    return bool(row and int(row[0]) == 1)
+
+
+def db_stats_summary(days: int = 30) -> dict:
+    """
+    Devuelve estadísticas básicas de uso en los últimos `days` días.
+    """
+    con = db_connect()
+    cur = con.cursor()
+
+    since = (datetime.utcnow() - timedelta(days=days)).isoformat(timespec="seconds")
+    cur.execute(
+        "SELECT COUNT(*) FROM usage_events WHERE ts >= ?",
+        (since,),
+    )
+    total = int(cur.fetchone()[0])
+
+    cur.execute(
+        """
+        SELECT command, COUNT(*) as c
+        FROM usage_events
+        WHERE ts >= ?
+        GROUP BY command
+        ORDER BY c DESC
+        """,
+        (since,),
+    )
+    by_cmd = cur.fetchall()
+
+    cur.execute("SELECT COUNT(*) FROM weekly_subscriptions WHERE enabled=1")
+    subs = int(cur.fetchone()[0])
+
+    con.close()
+
+    return {
+        "since": since,
+        "total": total,
+        "by_cmd": by_cmd,
+        "subs": subs,
+        "days": days,
+    }
+
+
 # ================== UTILIDADES ==================
 def normalizar_fecha_ddmmyy_a_ddmmyyyy(ddmmyy: str) -> str:
     d, m, yy = ddmmyy.split("/")
@@ -137,7 +180,7 @@ def extraer_timestamp(texto: str) -> Optional[str]:
     if not m:
         return None
 
-    fecha = m.group(1)  # dd/mm/yy o dd/mm/yyyy
+    fecha = m.group(1)
     hora = m.group(3)
 
     parts = fecha.split("/")
@@ -168,6 +211,25 @@ def fecha_de_timestamp(ts: Optional[str]) -> str:
     return datetime.utcnow().strftime("%d/%m/%Y")
 
 
+def proximo_envio_semanal_utc(now_utc: Optional[datetime] = None) -> datetime:
+    """
+    Calcula el próximo envío en UTC usando weekday() y hora configurada.
+    Nota: esto es UTC (Render suele ir en UTC). Si quisieras Madrid exacto,
+    se puede añadir zoneinfo.
+    """
+    now = now_utc or datetime.utcnow()
+
+    target = now.replace(hour=WEEKLY_SEND_HOUR, minute=WEEKLY_SEND_MINUTE, second=0, microsecond=0)
+
+    days_ahead = (WEEKLY_SEND_DAY - target.weekday()) % 7
+    candidate = target + timedelta(days=days_ahead)
+
+    if candidate <= now:
+        candidate += timedelta(days=7)
+
+    return candidate
+
+
 # ================== PDF ==================
 def descargar_pdf(url: str) -> bytes:
     r = requests.get(url, timeout=25)
@@ -188,10 +250,6 @@ def extraer_linea_estacion(texto: str, key: str) -> Optional[str]:
 
 
 def extraer_fechas_cabecera_semanal(pdf_bytes: bytes, ts: Optional[str]) -> Optional[List[str]]:
-    """
-    Cabecera tipo: "Día actual" + "09/12/25" "08/12/25" ...
-    Devuelve lista (dd/mm/yyyy) en el orden del PDF (normalmente más reciente -> más antiguo).
-    """
     fecha_actual = fecha_de_timestamp(ts)
 
     try:
@@ -247,7 +305,7 @@ def formatear_hoy(timestamp: Optional[str], linea: Optional[str]) -> str:
         header += " (actualizado: no detectado)"
 
     if not linea:
-        return header + "\n\nHoy no se han registrado precipitaciones en *Huelma*."
+        return header + "\n\nNo se han registrado precipitaciones en *Huelma* hoy."
 
     valores = parsear_valores(linea)
     msg = header + "\n"
@@ -273,11 +331,9 @@ def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]]
     if len(valores) < 7:
         return header + "\n\nNo hay suficientes valores para mostrar la semana."
 
-    # acumulados (estructura actual: últimos 2 números)
     mes_actual = valores[-2] if len(valores) >= 2 else None
     anio_hidrologico = valores[-1] if len(valores) >= 1 else None
 
-    # columnas diarias según cabecera real
     if fechas_cols and len(fechas_cols) >= 2:
         n = len(fechas_cols)
     else:
@@ -289,8 +345,6 @@ def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]]
 
     lluvias = valores[:n]
 
-    # El PDF suele venir en orden "más reciente -> más antiguo".
-    # Tú quieres: más reciente arriba (perfecto, lo dejamos como viene).
     msg = header + "\n"
     msg += "*Huelma – lluvia diaria (mm):*\n"
 
@@ -298,7 +352,6 @@ def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]]
         for f, v in zip(fechas_cols, lluvias):
             msg += f"• {f}: *{v:.1f}* mm\n"
     else:
-        # fallback (estimación por timestamp)
         end_date = datetime.strptime(fecha_de_timestamp(timestamp), "%d/%m/%Y").date()
         fechas_est = [(end_date - timedelta(days=i)).strftime("%d/%m/%Y") for i in range(0, n)]
         for f, v in zip(fechas_est, lluvias):
@@ -331,18 +384,6 @@ def obtener_semanal() -> str:
     return formatear_semanal(ts, fechas_cols, linea)
 
 
-# ================== UI (BOTONES) ==================
-def keyboard_principal() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Hoy", callback_data="BTN_HOY"),
-                InlineKeyboardButton("Semanal", callback_data="BTN_SEMANAL"),
-            ],
-        ]
-    )
-
-
 # ================== TELEGRAM HANDLERS ==================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -350,8 +391,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_log_usage(chat_id, username, "/start")
 
     await update.message.reply_text(
-        "Hola 👋\n\nElige una opción:",
-        reply_markup=keyboard_principal(),
+        "Hola 👋\n"
+        "Datos de lluvia en Huelma.\n\n"
+        "/hoy  → lluvia diaria\n"
+        "/siete → lluvia semanal\n"
+        f"/suscribir → recibir *Lluvia semanal* cada {WEEKLY_SEND_DAY_NAME} a las {WEEKLY_SEND_TIME_STR}\n"
+        "/cancelar → cancelar suscripción\n"
+        "/estado → ver estado de suscripción",
+        parse_mode="Markdown",
     )
 
 
@@ -359,34 +406,16 @@ async def hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     username = update.effective_user.username if update.effective_user else None
     db_log_usage(chat_id, username, "/hoy")
-
-    await update.message.reply_markdown(obtener_hoy(), reply_markup=keyboard_principal())
+    await update.message.reply_markdown(obtener_hoy())
 
 
 async def siete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     username = update.effective_user.username if update.effective_user else None
     db_log_usage(chat_id, username, "/siete")
-
-    await update.message.reply_markdown(obtener_semanal(), reply_markup=keyboard_principal())
-
-
-async def buttons_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    chat_id = query.message.chat_id
-    username = query.from_user.username if query.from_user else None
-
-    if query.data == "BTN_HOY":
-        db_log_usage(chat_id, username, "BTN_HOY")
-        await query.message.reply_markdown(obtener_hoy(), reply_markup=keyboard_principal())
-    elif query.data == "BTN_SEMANAL":
-        db_log_usage(chat_id, username, "BTN_SEMANAL")
-        await query.message.reply_markdown(obtener_semanal(), reply_markup=keyboard_principal())
+    await update.message.reply_markdown(obtener_semanal())
 
 
-# ===== Suscripción semanal =====
 async def suscribir_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     username = update.effective_user.username if update.effective_user else None
@@ -394,8 +423,7 @@ async def suscribir_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db_set_weekly_subscription(chat_id, True)
     await update.message.reply_text(
-        "✅ Suscripción semanal activada.\nTe enviaré el informe *Semanal* automáticamente.",
-        reply_markup=keyboard_principal(),
+        f"✅ Suscripción semanal activada.\nTe enviaré *Lluvia semanal* cada {WEEKLY_SEND_DAY_NAME} a las {WEEKLY_SEND_TIME_STR}.",
         parse_mode="Markdown",
     )
 
@@ -406,15 +434,56 @@ async def cancelar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_log_usage(chat_id, username, "/cancelar")
 
     db_set_weekly_subscription(chat_id, False)
+    await update.message.reply_text("🛑 Suscripción semanal desactivada.")
+
+
+async def estado_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username if update.effective_user else None
+    db_log_usage(chat_id, username, "/estado")
+
+    sub = db_is_subscribed(chat_id)
+    proximo = proximo_envio_semanal_utc()
+
+    estado = "✅ Activada" if sub else "⛔ Desactivada"
     await update.message.reply_text(
-        "🛑 Suscripción semanal desactivada.",
-        reply_markup=keyboard_principal(),
+        "📌 *Estado*\n"
+        f"• Suscripción semanal: {estado}\n"
+        f"• Envío: cada {WEEKLY_SEND_DAY_NAME} a las {WEEKLY_SEND_TIME_STR}\n"
+        f"• Próximo envío (UTC): {proximo.strftime('%d/%m/%Y %H:%M')}",
+        parse_mode="Markdown",
     )
 
 
-# ===== Envío semanal (JobQueue) =====
+def _is_admin(chat_id: int) -> bool:
+    return ADMIN_CHAT_ID_INT is not None and chat_id == ADMIN_CHAT_ID_INT
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    username = update.effective_user.username if update.effective_user else None
+    db_log_usage(chat_id, username, "/stats")
+
+    if not _is_admin(chat_id):
+        await update.message.reply_text("Este comando es solo para el administrador.")
+        return
+
+    s = db_stats_summary(days=30)
+    lines = [
+        "📊 *Uso del bot (últimos 30 días)*",
+        f"• Total: *{s['total']}*",
+        f"• Suscriptores activos: *{s['subs']}*",
+        "",
+        "*Por comando:*",
+    ]
+    for cmd, c in s["by_cmd"][:10]:
+        lines.append(f"• {cmd}: {c}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ================== JOB SEMANAL ==================
 async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
-    # Nota: aquí no tenemos Update; enviamos a todos los suscriptores
     subs = db_get_weekly_subscribers()
     if not subs:
         return
@@ -422,12 +491,7 @@ async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
     msg = obtener_semanal()
     for chat_id in subs:
         try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=msg,
-                parse_mode="Markdown",
-                reply_markup=keyboard_principal(),
-            )
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
             db_log_usage(chat_id, None, "AUTO_WEEKLY")
         except Exception:
             logger.exception("No pude enviar semanal a chat_id=%s", chat_id)
@@ -435,37 +499,30 @@ async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
 
 # ================== TELEGRAM INIT (loop persistente) ==================
 async def _tg_post_init(application: Application):
-    # Registrar comandos visibles en el menú de Telegram (/)
-    try:
-        await application.bot.set_my_commands(
-            [
-                BotCommand("hoy", "Lluvia registrada hoy en Huelma"),
-                BotCommand("siete", "Lluvia semanal (por días)"),
-                BotCommand("suscribir", "Recibir el informe semanal automáticamente"),
-                BotCommand("cancelar", "Cancelar la suscripción semanal"),
-                BotCommand("start", "Mostrar botones"),
-            ]
-        )
-    except Exception:
-        logger.exception("No pude setear comandos del bot")
+    await application.bot.set_my_commands(
+        [
+            BotCommand("hoy", "Lluvia registrada hoy en Huelma"),
+            BotCommand("siete", "Lluvia semanal (por días)"),
+            BotCommand("suscribir", f"Recibir la lluvia semanal cada {WEEKLY_SEND_DAY_NAME}"),
+            BotCommand("cancelar", "Cancelar la suscripción semanal"),
+            BotCommand("estado", "Ver estado de la suscripción"),
+            BotCommand("start", "Ver ayuda"),
+        ]
+    )
 
-    # Programar el envío semanal (JobQueue)
-    # Lo programamos con run_daily comprobando el día de la semana.
-    def _should_send_today() -> bool:
-        return datetime.now().weekday() == WEEKLY_SEND_DAY
+    # job diario que solo envía si hoy es el día configurado
+    def _is_send_day() -> bool:
+        return datetime.utcnow().weekday() == WEEKLY_SEND_DAY
 
     async def _weekly_wrapper(ctx: ContextTypes.DEFAULT_TYPE):
-        if _should_send_today():
+        if _is_send_day():
             await weekly_job(ctx)
 
-    try:
-        application.job_queue.run_daily(
-            _weekly_wrapper,
-            time=time(WEEKLY_SEND_HOUR, WEEKLY_SEND_MINUTE),
-            name="weekly_subscriptions",
-        )
-    except Exception:
-        logger.exception("No pude programar el job semanal")
+    application.job_queue.run_daily(
+        _weekly_wrapper,
+        time=time(WEEKLY_SEND_HOUR, WEEKLY_SEND_MINUTE),
+        name="weekly_subscriptions",
+    )
 
 
 async def _tg_init_app():
@@ -482,10 +539,11 @@ async def _tg_init_app():
     tg_app.add_handler(CommandHandler("siete", siete_cmd))
     tg_app.add_handler(CommandHandler("suscribir", suscribir_cmd))
     tg_app.add_handler(CommandHandler("cancelar", cancelar_cmd))
-    tg_app.add_handler(CallbackQueryHandler(buttons_cb))
+    tg_app.add_handler(CommandHandler("estado", estado_cmd))
+    tg_app.add_handler(CommandHandler("stats", stats_cmd))
 
     await tg_app.initialize()
-    await tg_app.start()  # importante para JobQueue y tareas internas
+    await tg_app.start()
     await _tg_post_init(tg_app)
 
     logger.info("Telegram Application inicializada (loop persistente).")
@@ -526,7 +584,6 @@ def webhook():
             return "not ready", 503
 
         update = Update.de_json(update_json, tg_app.bot)
-
         fut = asyncio.run_coroutine_threadsafe(tg_app.process_update(update), tg_loop)
         fut.result(timeout=20)
 
