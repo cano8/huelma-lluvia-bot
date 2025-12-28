@@ -155,6 +155,25 @@ def db_stats_summary(days: int = 30) -> dict:
     con.close()
     return {"total": total, "by_cmd": by_cmd, "subs": subs, "days": days}
 
+def parsear_timestamp_a_dt(ts: Optional[str]) -> Optional[datetime]:
+    """
+    ts esperado: 'dd/mm/yyyy H:MM' o 'dd/mm/yyyy HH:MM'
+    Devuelve datetime o None.
+    """
+    if not ts:
+        return None
+    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M"):
+        # (dejamos uno por claridad; realmente con %H acepta 0-padded y no 0-padded en Python)
+        try:
+            return datetime.strptime(ts, "%d/%m/%Y %H:%M")
+        except ValueError:
+            continue
+    # En algunos entornos puede fallar si viene con espacios raros
+    try:
+        return datetime.strptime(ts.strip(), "%d/%m/%Y %H:%M")
+    except Exception:
+        return None
+
 
 # ================== UTILIDADES ==================
 def normalizar_fecha_ddmmyy_a_ddmmyyyy(ddmmyy: str) -> str:
@@ -289,13 +308,44 @@ def formatear_hoy(timestamp: Optional[str], linea: Optional[str]) -> str:
 
     valores = parsear_valores(linea)
 
-    # En el PDF de "hoy" la tabla suele ser:
-    # HORA: Actual, Anterior
-    # DÍA:  Actual, Anterior
-    # MES:  Actual, Anterior
-    # AÑO HIDROLÓGICO: Actual
-    # => 7 valores
-    etiquetas = [
+    # Esperamos 7 valores:
+    # HORA: actual, anterior
+    # DÍA:  actual, anterior
+    # MES:  actual, anterior
+    # AÑO HIDROLÓGICO: actual
+    msg = header + "\n*Huelma*:\n"
+
+    dt = parsear_timestamp_a_dt(timestamp)
+
+    if len(valores) >= 7 and dt:
+        dt_hora_ant = dt - timedelta(hours=1)
+        dt_dia_ant = dt - timedelta(days=1)
+
+        # mes anterior correcto (si enero -> diciembre del año anterior)
+        year, month = dt.year, dt.month
+        if month == 1:
+            prev_month, prev_year = 12, year - 1
+        else:
+            prev_month, prev_year = month - 1, year
+
+etiquetas = [
+    f"Hora ({dt.strftime('%H')})",
+    f"Hora ({dt_hora_ant.strftime('%H')})",
+    f"Día ({dt.strftime('%d/%m')})",
+    f"Día ({dt_dia_ant.strftime('%d/%m')})",
+    f"Mes ({dt.strftime('%m/%Y')})",
+    f"Mes ({prev_month:02d}/{prev_year})",
+    "Año hidrológico (actual)",
+]
+
+        ]
+
+        for lab, v in zip(etiquetas, valores[:7]):
+            msg += f"• {lab}: *{v:.1f}* mm\n"
+        return msg.strip()
+
+    # Si no tenemos timestamp parseable o cambió el formato: fallback
+    etiquetas_fallback = [
         "Hora (actual)",
         "Hora (anterior)",
         "Día (actual)",
@@ -304,20 +354,17 @@ def formatear_hoy(timestamp: Optional[str], linea: Optional[str]) -> str:
         "Mes (anterior)",
         "Año hidrológico (actual)",
     ]
-
-    msg = header + "\n*Huelma*:\n"
-
     if len(valores) >= 7:
-        for lab, v in zip(etiquetas, valores[:7]):
+        for lab, v in zip(etiquetas_fallback, valores[:7]):
             msg += f"• {lab}: *{v:.1f}* mm\n"
         return msg.strip()
 
-    # Fallback si el PDF cambia y no vienen 7 valores
     if valores:
         msg += "Valores detectados (mm): " + ", ".join(f"{v:.1f}" for v in valores)
     else:
         msg += "He encontrado la fila, pero no he podido extraer valores numéricos."
     return msg
+
 
 
 
@@ -643,6 +690,7 @@ def webhook():
         return "ok", 200
 
     return "ok", 200
+
 
 
 
