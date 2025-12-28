@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ================== REGEX ==================
-TS_RE = re.compile(r"\b(\d{2}/\d{2}/(\d{2}|\d{4}))\s+(\d{2}:\d{2})\b")
+TS_RE = re.compile(r"\b(\d{2}/\d{2}/(\d{2}|\d{4}))\s+(\d{1,2}:\d{2})\b")
 DATE_2Y_RE = re.compile(r"\b(\d{2}/\d{2}/\d{2})\b")
 
 # ================== TELEGRAM GLOBALS ==================
@@ -288,12 +288,37 @@ def formatear_hoy(timestamp: Optional[str], linea: Optional[str]) -> str:
         return header + "\n\nNo se han registrado precipitaciones en *Huelma* hoy."
 
     valores = parsear_valores(linea)
+
+    # En el PDF de "hoy" la tabla suele ser:
+    # HORA: Actual, Anterior
+    # DÍA:  Actual, Anterior
+    # MES:  Actual, Anterior
+    # AÑO HIDROLÓGICO: Actual
+    # => 7 valores
+    etiquetas = [
+        "Hora (actual)",
+        "Hora (anterior)",
+        "Día (actual)",
+        "Día (anterior)",
+        "Mes (actual)",
+        "Mes (anterior)",
+        "Año hidrológico (actual)",
+    ]
+
     msg = header + "\n*Huelma*:\n"
+
+    if len(valores) >= 7:
+        for lab, v in zip(etiquetas, valores[:7]):
+            msg += f"• {lab}: *{v:.1f}* mm\n"
+        return msg.strip()
+
+    # Fallback si el PDF cambia y no vienen 7 valores
     if valores:
         msg += "Valores detectados (mm): " + ", ".join(f"{v:.1f}" for v in valores)
     else:
         msg += "He encontrado la fila, pero no he podido extraer valores numéricos."
     return msg
+
 
 
 def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]], linea: Optional[str]) -> str:
@@ -618,5 +643,6 @@ def webhook():
         return "ok", 200
 
     return "ok", 200
+
 
 
