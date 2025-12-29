@@ -6,7 +6,7 @@ import threading
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta, time
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import requests
 import pdfplumber
@@ -17,7 +17,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================== CONFIG ==================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # pon aquí tu chat_id para /stats
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 ADMIN_CHAT_ID_INT = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID and ADMIN_CHAT_ID.isdigit() else None
 
 URL_HOY = "https://www.chguadalquivir.es/saih/tmp/Lluvia_Hoy.pdf"
@@ -25,9 +25,8 @@ URL_7DIAS = "https://www.chguadalquivir.es/saih/tmp/LLuvia_7d%C3%ADas.pdf"
 
 ESTACION_HUELMA_KEY = "Huelma"
 
-# Suscripción semanal: Domingo 20:00
-# 0=Lunes ... 6=Domingo
-WEEKLY_SEND_DAY = 6
+# Suscripción semanal: domingo 20:00 (UTC)
+WEEKLY_SEND_DAY = 6  # 0=Lunes ... 6=Domingo
 WEEKLY_SEND_HOUR = 20
 WEEKLY_SEND_MINUTE = 0
 WEEKLY_SEND_DAY_NAME = "domingo"
@@ -41,8 +40,15 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ================== REGEX ==================
+# acepta 28/12/2025 9:55 o 28/12/2025 09:55 y también yy
 TS_RE = re.compile(r"\b(\d{2}/\d{2}/(\d{2}|\d{4}))\s+(\d{1,2}:\d{2})\b")
 DATE_2Y_RE = re.compile(r"\b(\d{2}/\d{2}/\d{2})\b")
+
+MESES_ES = {
+    1: "enero", 2: "febrero", 3: "marzo", 4: "abril",
+    5: "mayo", 6: "junio", 7: "julio", 8: "agosto",
+    9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre",
+}
 
 # ================== TELEGRAM GLOBALS ==================
 tg_app: Optional[Application] = None
@@ -155,25 +161,6 @@ def db_stats_summary(days: int = 30) -> dict:
     con.close()
     return {"total": total, "by_cmd": by_cmd, "subs": subs, "days": days}
 
-def parsear_timestamp_a_dt(ts: Optional[str]) -> Optional[datetime]:
-    """
-    ts esperado: 'dd/mm/yyyy H:MM' o 'dd/mm/yyyy HH:MM'
-    Devuelve datetime o None.
-    """
-    if not ts:
-        return None
-    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M"):
-        # (dejamos uno por claridad; realmente con %H acepta 0-padded y no 0-padded en Python)
-        try:
-            return datetime.strptime(ts, "%d/%m/%Y %H:%M")
-        except ValueError:
-            continue
-    # En algunos entornos puede fallar si viene con espacios raros
-    try:
-        return datetime.strptime(ts.strip(), "%d/%m/%Y %H:%M")
-    except Exception:
-        return None
-
 
 # ================== UTILIDADES ==================
 def normalizar_fecha_ddmmyy_a_ddmmyyyy(ddmmyy: str) -> str:
@@ -195,6 +182,23 @@ def extraer_timestamp(texto: str) -> Optional[str]:
         fecha = normalizar_fecha_ddmmyy_a_ddmmyyyy(fecha)
 
     return f"{fecha} {hora}"
+
+
+def parsear_timestamp_a_dt(ts: Optional[str]) -> Optional[datetime]:
+    """
+    ts esperado: 'dd/mm/yyyy H:MM' o 'dd/mm/yyyy HH:MM'
+    """
+    if not ts:
+        return None
+
+    m = re.match(r"^\s*(\d{2})/(\d{2})/(\d{4})\s+(\d{1,2}):(\d{2})\s*$", ts)
+    if not m:
+        return None
+    dd, mm, yyyy, hh, mi = m.groups()
+    try:
+        return datetime(int(yyyy), int(mm), int(dd), int(hh), int(mi))
+    except Exception:
+        return None
 
 
 def parsear_valores(linea: str) -> List[float]:
@@ -249,8 +253,8 @@ def extraer_linea_estacion(texto: str, key: str) -> Optional[str]:
 
 def extraer_fechas_cabecera_semanal(pdf_bytes: bytes, ts: Optional[str]) -> Optional[List[str]]:
     """
-    Lee la cabecera real del PDF: "Día actual" + "09/12/25"...
-    Devuelve lista dd/mm/yyyy en el orden del PDF (normalmente más reciente -> más antiguo).
+    Lee la cabecera real del PDF semanal (Día actual + dd/mm/yy...).
+    Devuelve fechas dd/mm/yyyy en el orden del PDF (normalmente más reciente -> más antiguo).
     """
     fecha_actual = fecha_de_timestamp(ts)
 
@@ -292,7 +296,6 @@ def extraer_fechas_cabecera_semanal(pdf_bytes: bytes, ts: Optional[str]) -> Opti
                 if x not in seen:
                     seen.add(x)
                     out2.append(x)
-
             return out2
 
     return None
@@ -307,65 +310,49 @@ def formatear_hoy(timestamp: Optional[str], linea: Optional[str]) -> str:
         return header + "\n\nNo se han registrado precipitaciones en *Huelma* hoy."
 
     valores = parsear_valores(linea)
-
-    # Esperamos 7 valores:
-    # HORA: actual, anterior
-    # DÍA:  actual, anterior
-    # MES:  actual, anterior
-    # AÑO HIDROLÓGICO: actual
     msg = header + "\n*Huelma*:\n"
 
+    # Esperado en el PDF de hoy:
+    # valores = [hora_act, hora_ant, dia_act, dia_ant, mes_act, mes_ant, anio_hid]
     dt = parsear_timestamp_a_dt(timestamp)
 
     if len(valores) >= 7 and dt:
         dt_hora_ant = dt - timedelta(hours=1)
         dt_dia_ant = dt - timedelta(days=1)
 
-        # mes anterior correcto (si enero -> diciembre del año anterior)
-        year, month = dt.year, dt.month
-        if month == 1:
-            prev_month, prev_year = 12, year - 1
+        # mes anterior (solo etiqueta)
+        if dt.month == 1:
+            prev_month, prev_year = 12, dt.year - 1
         else:
-            prev_month, prev_year = month - 1, year
+            prev_month, prev_year = dt.month - 1, dt.year
 
-etiquetas = [
-    f"Hora ({dt.strftime('%H')})",
-    f"Hora ({dt_hora_ant.strftime('%H')})",
-    f"Día ({dt.strftime('%d/%m')})",
-    f"Día ({dt_dia_ant.strftime('%d/%m')})",
-    f"Mes ({dt.strftime('%m/%Y')})",
-    f"Mes ({prev_month:02d}/{prev_year})",
-    "Año hidrológico (actual)",
-]
+        mes_actual_txt = f"{dt.month:02d}-{MESES_ES.get(dt.month, str(dt.month))}"
+        mes_anterior_txt = f"{prev_month:02d}-{MESES_ES.get(prev_month, str(prev_month))}"
 
+        # Reorden: Día (act/ant), Hora (act/ant), Mes (act/ant), Año hidrológico (actual)
+        orden_idx = [2, 3, 0, 1, 4, 5, 6]
+        valores_ordenados = [valores[i] for i in orden_idx]
+
+        etiquetas = [
+            f"Día ({dt.strftime('%d/%m')})",
+            f"Día ({dt_dia_ant.strftime('%d/%m')})",
+            f"Hora ({dt.strftime('%H')}h)",
+            f"Hora ({dt_hora_ant.strftime('%H')}h)",
+            f"Mes ({mes_actual_txt})",
+            f"Mes ({mes_anterior_txt})",
+            "Año hidrológico (actual)",
         ]
 
-        for lab, v in zip(etiquetas, valores[:7]):
+        for lab, v in zip(etiquetas, valores_ordenados):
             msg += f"• {lab}: *{v:.1f}* mm\n"
         return msg.strip()
 
-    # Si no tenemos timestamp parseable o cambió el formato: fallback
-    etiquetas_fallback = [
-        "Hora (actual)",
-        "Hora (anterior)",
-        "Día (actual)",
-        "Día (anterior)",
-        "Mes (actual)",
-        "Mes (anterior)",
-        "Año hidrológico (actual)",
-    ]
-    if len(valores) >= 7:
-        for lab, v in zip(etiquetas_fallback, valores[:7]):
-            msg += f"• {lab}: *{v:.1f}* mm\n"
-        return msg.strip()
-
+    # Fallback (si cambia el PDF)
     if valores:
         msg += "Valores detectados (mm): " + ", ".join(f"{v:.1f}" for v in valores)
     else:
         msg += "He encontrado la fila, pero no he podido extraer valores numéricos."
     return msg
-
-
 
 
 def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]], linea: Optional[str]) -> str:
@@ -379,11 +366,9 @@ def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]]
     if len(valores) < 7:
         return header + "\n\nNo hay suficientes valores para mostrar la semana."
 
-    # acumulados (los dos últimos números)
     mes_actual = valores[-2] if len(valores) >= 2 else None
     anio_hidrologico = valores[-1] if len(valores) >= 1 else None
 
-    # columnas según cabecera real del PDF
     if fechas_cols and len(fechas_cols) >= 2:
         n = len(fechas_cols)
     else:
@@ -399,11 +384,9 @@ def formatear_semanal(timestamp: Optional[str], fechas_cols: Optional[List[str]]
     msg += "*Huelma – lluvia diaria (mm):*\n"
 
     if fechas_cols:
-        # El PDF suele estar en orden más reciente -> más antiguo (eso es lo que tú quieres)
         for f, v in zip(fechas_cols, lluvias):
             msg += f"• {f}: *{v:.1f}* mm\n"
     else:
-        # fallback
         end_date = datetime.strptime(fecha_de_timestamp(timestamp), "%d/%m/%Y").date()
         fechas_est = [(end_date - timedelta(days=i)).strftime("%d/%m/%Y") for i in range(0, n)]
         for f, v in zip(fechas_est, lluvias):
@@ -438,9 +421,7 @@ def obtener_semanal() -> str:
 
 # ================== TELEGRAM HANDLERS ==================
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Start robusto: sin Markdown para evitar errores de parseo.
-    """
+    # SIN Markdown aquí (evita errores de parseo)
     try:
         chat_id = update.effective_chat.id
         user = update.effective_user
@@ -449,12 +430,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = (
             "Hola 👋\n"
-            "Te muestro los datos de lluvia en Huelma. Estos datos se extraen de la Confederación Hidrográfica del Guadalquivir (CHG). Los comandos disponibles son los siguientes:\n\n"
-            "/hoy  → lluvia hoy\n"
+            "Datos de lluvia en Huelma.\n\n"
+            "/hoy  → lluvia diaria\n"
             "/semanal → lluvia semanal\n"
-            f"/suscribir → recibir datos de lluvia semanal cada {WEEKLY_SEND_DAY_NAME} a las {WEEKLY_SEND_TIME_STR}\n"
+            f"/suscribir → recibir lluvia semanal cada {WEEKLY_SEND_DAY_NAME} a las {WEEKLY_SEND_TIME_STR}\n"
             "/cancelar → cancelar suscripción\n"
-            "/estado → ver estado de suscripción"
+            "/estado → ver estado de suscripción\n"
+            "/chatid → ver tu chat_id (para admin)\n"
+            "/stats → (admin) ver estadísticas"
         )
 
         msg = update.effective_message
@@ -472,7 +455,6 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-
 async def hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     username = update.effective_user.username if update.effective_user else None
@@ -487,8 +469,8 @@ async def semanal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_markdown(obtener_semanal())
 
 
-# Alias opcional para no romper /siete
 async def siete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # alias por compatibilidad
     chat_id = update.effective_chat.id
     username = update.effective_user.username if update.effective_user else None
     db_log_usage(chat_id, username, "/siete(alias)")
@@ -581,9 +563,8 @@ async def weekly_job(context: ContextTypes.DEFAULT_TYPE):
             logger.exception("No pude enviar semanal a chat_id=%s", chat_id)
 
 
-# ================== TELEGRAM INIT (loop persistente) ==================
+# ================== TELEGRAM INIT ==================
 async def _tg_post_init(application: Application):
-    # Menú de comandos
     await application.bot.set_my_commands(
         [
             BotCommand("hoy", "Lluvia registrada hoy en Huelma"),
@@ -596,13 +577,11 @@ async def _tg_post_init(application: Application):
         ]
     )
 
-    # JobQueue opcional: si no existe, NO tiramos el bot
     if application.job_queue is None:
         logger.warning("JobQueue no disponible: el bot funciona, pero NO enviará mensajes automáticos.")
         return
 
     async def _weekly_wrapper(ctx: ContextTypes.DEFAULT_TYPE):
-        # Día en UTC (si quieres hora Madrid exacta, lo ajusto con zoneinfo)
         if datetime.utcnow().weekday() == WEEKLY_SEND_DAY:
             await weekly_job(ctx)
 
@@ -673,24 +652,25 @@ def index():
 @app.post("/webhook")
 @app.post("/webhook/")
 def webhook():
+    """
+    MUY IMPORTANTE: responder rápido a Telegram.
+    Procesamos el update en segundo plano (no bloqueamos).
+    """
     try:
         ensure_tg_thread()
 
         if tg_loop is None or tg_app is None or not tg_ready:
+            # Telegram reintentará; esto puede pasar en cold start.
             return "not ready", 503
 
         update_json = request.get_json(force=True)
         update = Update.de_json(update_json, tg_app.bot)
 
-        fut = asyncio.run_coroutine_threadsafe(tg_app.process_update(update), tg_loop)
-        fut.result(timeout=20)
+        asyncio.run_coroutine_threadsafe(tg_app.process_update(update), tg_loop)
 
     except Exception:
         logger.exception("Error procesando update")
+        # Aun así, devolvemos ok para evitar reintentos infinitos por fallos puntuales
         return "ok", 200
 
     return "ok", 200
-
-
-
-
