@@ -1,587 +1,394 @@
-# app.py
 import os
 import re
-import io
 import json
 import time
 import sqlite3
-import logging
-import tempfile
-import threading
-import asyncio
 from datetime import datetime, timedelta
-from urllib.parse import urljoin
+from html import escape as html_escape
 
 import requests
-from flask import Flask, request, abort
-
-from PyPDF2 import PdfReader
-
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from bs4 import BeautifulSoup
+from dateutil.relativedelta import relativedelta
+from flask import Flask, request
 
 # =========================
-# CONFIG
+# Config
 # =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
-)
-logger = logging.getLogger("bot")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("Falta BOT_TOKEN en variables de entorno.")
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Falta TELEGRAM_TOKEN en variables de entorno.")
+# URL donde está la tabla "INFORMACIÓN PLUVIOMÉTRICA" con HORA / DÍA / MES / AÑO HIDROLÓGICO
+PLUVO_URL = os.environ.get("PLUO_URL") or os.environ.get("PLUVO_URL", "").strip()
 
-# (Opcional) protege el endpoint: /webhook/<WEBHOOK_SECRET>
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()  # recomendable
-WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}" if WEBHOOK_SECRET else "/webhook"
+# URL de Informes.aspx (si quieres usarlo para semanal o enlaces)
+INFORMES_URL = os.environ.get("INFORMES_URL", "").strip()
 
-BASE_SAIH = "https://www.chguadalquivir.es/saih/"
-INFORMES_URL = urljoin(BASE_SAIH, "Informes.aspx")
+# Localidad objetivo
+TARGET_NAME = os.environ.get("TARGET_NAME", "Huelma").strip()
 
-# Si /hoy lo tienes ya estable por URL directa, déjalo aquí:
-# (si algún día cambia, se puede adaptar igual que semanal)
-URL_HOY_PDF_DIRECTO = urljoin(BASE_SAIH, "tmp/LLuvia_diaria.pdf")
+# Username admin (sin @). En tu caso: Rc_8_8
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "Rc_8_8").lstrip("@").strip()
 
-ESTACION_HUELMA_KEY = "Huelma"  # cómo aparece en el PDF
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-DB_PATH = os.environ.get("DB_PATH", "bot.db")
+# SQLite para registrar usos
+DB_PATH = os.environ.get("DB_PATH", "bot_stats.sqlite3")
 
-# Timeouts
-HTTP_TIMEOUT = 30
+# Timeout requests
+HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "20"))
+
+app = Flask(__name__)
 
 # =========================
-# DB
+# DB helpers
 # =========================
-def db_connect():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 def db_init():
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts INTEGER NOT NULL,
-            user_id INTEGER,
-            username TEXT,
-            command TEXT NOT NULL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            enabled INTEGER NOT NULL DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-def db_log_usage(user_id: int | None, username: str | None, command: str):
-    try:
-        conn = db_connect()
-        cur = conn.cursor()
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
         cur.execute(
-            "INSERT INTO usage (ts, user_id, username, command) VALUES (?,?,?,?)",
-            (int(time.time()), user_id, username, command),
+            """
+            CREATE TABLE IF NOT EXISTS usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                username TEXT,
+                command TEXT NOT NULL
+            )
+            """
         )
-        conn.commit()
-        conn.close()
-    except Exception:
-        logger.exception("Error guardando uso en DB")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subs (
+                chat_id TEXT PRIMARY KEY,
+                username TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_ts TEXT NOT NULL
+            )
+            """
+        )
+        con.commit()
 
-def db_get_usage_stats():
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM usage")
-    total = cur.fetchone()["c"]
+def db_log_usage(chat_id: str, username: str | None, command: str):
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO usage (ts, chat_id, username, command) VALUES (?, ?, ?, ?)",
+            (datetime.now().isoformat(timespec="seconds"), str(chat_id), username, command),
+        )
+        con.commit()
 
-    cur.execute("SELECT command, COUNT(*) AS c FROM usage GROUP BY command ORDER BY c DESC")
-    by_cmd = cur.fetchall()
-
-    conn.close()
-    return total, by_cmd
-
-def db_get_subscription(user_id: int) -> bool:
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("SELECT enabled FROM subscriptions WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return bool(row and row["enabled"] == 1)
-
-def db_set_subscription(user_id: int, username: str | None, enabled: bool):
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO subscriptions (user_id, username, enabled)
-        VALUES (?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            enabled=excluded.enabled
-    """, (user_id, username, 1 if enabled else 0))
-    conn.commit()
-    conn.close()
+def db_usage_summary():
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute("SELECT COUNT(*) FROM usage")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT command, COUNT(*) FROM usage GROUP BY command ORDER BY COUNT(*) DESC")
+        by_cmd = cur.fetchall()
+        return total, by_cmd
 
 # =========================
-# HELPERS (PDF / PARSING)
+# Telegram helpers
 # =========================
-MESES_ES = {
+def tg_send_message(chat_id: int, text: str, reply_to_message_id: int | None = None):
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        # IMPORTANT: evitamos parse_mode para no volver a romper /start con caracteres raros
+        "parse_mode": None,
+        "disable_web_page_preview": True,
+    }
+    if reply_to_message_id is not None:
+        payload["reply_to_message_id"] = reply_to_message_id
+
+    r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+def get_message_text(update: dict) -> str:
+    msg = update.get("message") or update.get("edited_message") or {}
+    return (msg.get("text") or "").strip()
+
+def get_chat_id(update: dict) -> int | None:
+    msg = update.get("message") or update.get("edited_message") or {}
+    chat = msg.get("chat") or {}
+    return chat.get("id")
+
+def get_username(update: dict) -> str | None:
+    msg = update.get("message") or update.get("edited_message") or {}
+    frm = msg.get("from") or {}
+    u = frm.get("username")
+    return u
+
+def is_admin(username: str | None) -> bool:
+    if not username:
+        return False
+    return username.lstrip("@") == ADMIN_USERNAME
+
+# =========================
+# Scraping helpers
+# =========================
+MONTHS_ES = {
     1: "enero", 2: "febrero", 3: "marzo", 4: "abril",
     5: "mayo", 6: "junio", 7: "julio", 8: "agosto",
     9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
 }
 
-def safe_float(s: str) -> float:
-    s = s.strip().replace(",", ".")
-    return float(s)
-
-def pdf_text_from_bytes(pdf_bytes: bytes) -> str:
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    out = []
-    for page in reader.pages:
-        try:
-            out.append(page.extract_text() or "")
-        except Exception:
-            out.append("")
-    return "\n".join(out)
-
-def extract_timestamp_from_text(text: str) -> datetime | None:
+def parse_updated_datetime_from_html(html: str) -> datetime | None:
     """
-    Intenta encontrar algo tipo:
-    28/12/2025 12:52
-    o 28/12/2025 9:55
+    Busca textos tipo:
+    'Actualizados: 28/12/2025 12:52'
     """
-    m = re.search(r"(\d{2}/\d{2}/\d{4})\s+(\d{1,2}:\d{2})", text)
+    m = re.search(r"Actualizados:\s*(\d{2}/\d{2}/\d{4})\s+(\d{1,2}:\d{2})", html)
     if not m:
         return None
-    d, t = m.group(1), m.group(2)
-    # normaliza hora 9:55 -> 09:55
-    if len(t.split(":")[0]) == 1:
-        t = "0" + t
+    date_s, time_s = m.group(1), m.group(2)
     try:
-        return datetime.strptime(f"{d} {t}", "%d/%m/%Y %H:%M")
+        return datetime.strptime(f"{date_s} {time_s}", "%d/%m/%Y %H:%M")
     except ValueError:
         return None
 
-def find_station_line_numbers(text: str, station_key: str) -> list[float]:
+def find_huelma_row_values_from_pluvio_page(html: str, target_name: str) -> dict:
     """
-    Busca la línea de la estación y devuelve una lista de floats encontrados.
-    Para /hoy esperamos 7 valores:
-      Hora(actual), Hora(anterior), Día(actual), Día(anterior),
-      Mes(actual), Mes(anterior), Año Hidrológico(actual)
+    Espera encontrar una tabla donde en una fila aparezca el nombre del punto (Huelma)
+    y en columnas cercanas existan valores para:
+      - Hora Actual / Hora Anterior
+      - Día Actual / Día Anterior
+      - Mes Actual / Mes Anterior
+      - Año Hidrológico Actual
+
+    Devuelve dict con claves:
+      hour_actual, hour_prev, day_actual, day_prev, month_actual, month_prev, hydro_actual
     """
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    target = None
+    soup = BeautifulSoup(html, "html.parser")
 
-    # Busca línea que contenga exactamente el nombre (normalmente empieza por estación)
-    for ln in lines:
-        if station_key.lower() in ln.lower():
-            # descartamos líneas tipo encabezados
-            # y preferimos las que tengan números
-            nums = re.findall(r"[-+]?\d+(?:[.,]\d+)?", ln)
-            if len(nums) >= 5:
-                target = ln
-                break
+    # Estrategia robusta:
+    # 1) Buscamos cualquier tabla que contenga el texto del target.
+    tables = soup.find_all("table")
+    target_lower = target_name.strip().lower()
 
-    if not target:
-        # fallback: intenta unir varias líneas alrededor
-        for i, ln in enumerate(lines):
-            if station_key.lower() in ln.lower():
-                chunk = " ".join(lines[i:i+3])
-                nums = re.findall(r"[-+]?\d+(?:[.,]\d+)?", chunk)
-                if len(nums) >= 5:
-                    target = chunk
-                    break
+    for table in tables:
+        text = table.get_text(" ", strip=True).lower()
+        if target_lower not in text:
+            continue
 
-    if not target:
-        raise RuntimeError(f"No se encontró la fila de estación '{station_key}' en el PDF.")
+        # Recorremos filas
+        for tr in table.find_all("tr"):
+            tds = tr.find_all(["td", "th"])
+            if not tds:
+                continue
+            row_text = " ".join(td.get_text(" ", strip=True) for td in tds).lower()
+            if target_lower not in row_text:
+                continue
 
-    nums = re.findall(r"[-+]?\d+(?:[.,]\d+)?", target)
-    vals = [safe_float(x) for x in nums]
-    return vals
+            # Intentamos extraer números (mm) de la fila en orden
+            # Normalmente la fila tendrá: nombre + varios valores
+            # Sacamos todos los floats que aparezcan (con coma o punto)
+            raw = " ".join(td.get_text(" ", strip=True) for td in tds)
+            nums = re.findall(r"(-?\d+(?:[.,]\d+)?)", raw)
+            nums = [float(x.replace(",", ".")) for x in nums]
 
-def format_hoy_message(ts: datetime | None, vals: list[float]) -> str:
+            # Si el sitio devuelve exactamente 7 valores (como en tu screenshot):
+            # Hora actual, Hora anterior, Día actual, Día anterior, Mes actual, Mes anterior, Año hidrológico actual
+            if len(nums) >= 7:
+                return {
+                    "hour_actual": nums[0],
+                    "hour_prev": nums[1],
+                    "day_actual": nums[2],
+                    "day_prev": nums[3],
+                    "month_actual": nums[4],
+                    "month_prev": nums[5],
+                    "hydro_actual": nums[6],
+                }
+
+            # Si cambia el layout, preferimos fallar claramente
+            raise ValueError(
+                f"Fila encontrada para '{target_name}', pero no pude extraer 7 valores numéricos. Encontrados: {len(nums)}"
+            )
+
+    raise ValueError(f"No encontré una tabla/fila para '{target_name}' en la página de pluviometría.")
+
+def format_hoy_message(updated_dt: datetime | None, values: dict, place: str) -> str:
     """
-    vals esperados (por orden típico en CHG):
-      0: hora_actual
-      1: hora_anterior
-      2: dia_actual
-      3: dia_anterior
-      4: mes_actual
-      5: mes_anterior
-      6: anno_hidro_actual
+    Formato final pedido:
+    - primero día (actual y anterior): 28/12 y 27/12 (sin año)
+    - luego hora (actual y anterior): 12h y 11h (sin minutos)
+    - luego mes: 12-diciembre y 11-noviembre
+    - año hidrológico: (actual) se queda como 'actual'
     """
-    if len(vals) < 7:
-        # si por extracción vienen más valores, intentamos coger los 7 primeros
-        if len(vals) >= 7:
-            vals = vals[:7]
-        else:
-            raise RuntimeError(f"Se esperaban >=7 valores en /hoy y llegaron {len(vals)}: {vals}")
-
-    hora_act, hora_ant, dia_act, dia_ant, mes_act, mes_ant, ah_act = vals[:7]
-
-    if ts is None:
-        ts_txt = "no detectado"
-        # sin timestamp no podemos poner etiquetas temporales; ponemos genéricas
-        dia_act_lbl = "Día"
-        dia_ant_lbl = "Día-1"
-        hora_act_lbl = "Hora"
-        hora_ant_lbl = "Hora-1"
-        mes_act_lbl = "Mes"
-        mes_ant_lbl = "Mes-1"
+    # Si no hay updated_dt, no podemos mapear etiquetas por fecha/hora: ponemos fallback legible
+    if updated_dt is None:
+        day_label_actual = "día (actual)"
+        day_label_prev = "día (anterior)"
+        hour_label_actual = "hora (actual)"
+        hour_label_prev = "hora (anterior)"
+        month_label_actual = "mes (actual)"
+        month_label_prev = "mes (anterior)"
+        updated_str = "no detectado"
     else:
-        ts_txt = ts.strftime("%d/%m/%Y %H:%M")
+        # Etiquetas con el mapeo que quieres
+        dt_prev_h = updated_dt - timedelta(hours=1)
+        dt_prev_d = updated_dt - timedelta(days=1)
+        dt_prev_m = updated_dt - relativedelta(months=1)
 
-        # Día labels (sin año): 28/12
-        d_act = ts.date()
-        d_ant = (ts - timedelta(days=1)).date()
-        dia_act_lbl = d_act.strftime("%d/%m")
-        dia_ant_lbl = d_ant.strftime("%d/%m")
+        day_label_actual = updated_dt.strftime("%d/%m")
+        day_label_prev = dt_prev_d.strftime("%d/%m")
 
-        # Hora labels (solo hora en formato "12h")
-        h_act = ts.strftime("%H") + "h"
-        h_ant = (ts - timedelta(hours=1)).strftime("%H") + "h"
-        hora_act_lbl = h_act
-        hora_ant_lbl = h_ant
+        hour_label_actual = f"{updated_dt.hour}h"
+        hour_label_prev = f"{dt_prev_h.hour}h"
 
-        # Mes labels (12-diciembre / 11-noviembre)
-        mes_num_act = ts.month
-        mes_nom_act = MESES_ES.get(mes_num_act, str(mes_num_act))
-        # mes anterior (maneja enero -> diciembre del año anterior)
-        prev_month_dt = (ts.replace(day=1) - timedelta(days=1))
-        mes_num_ant = prev_month_dt.month
-        mes_nom_ant = MESES_ES.get(mes_num_ant, str(mes_num_ant))
-        mes_act_lbl = f"{mes_num_act:02d}-{mes_nom_act}"
-        mes_ant_lbl = f"{mes_num_ant:02d}-{mes_nom_ant}"
+        month_label_actual = f"{updated_dt.month:02d}-{MONTHS_ES[updated_dt.month]}"
+        month_label_prev = f"{dt_prev_m.month:02d}-{MONTHS_ES[dt_prev_m.month]}"
 
-    # Orden pedido: día, hora, mes, año hidrológico
-    msg = (
-        f"📄 Lluvia diaria (actualizado: {ts_txt})\n"
-        f"{ESTACION_HUELMA_KEY}:\n"
-        f"• Día ({dia_act_lbl}): {dia_act:.1f} mm\n"
-        f"• Día ({dia_ant_lbl}): {dia_ant:.1f} mm\n"
-        f"• Hora ({hora_act_lbl}): {hora_act:.1f} mm\n"
-        f"• Hora ({hora_ant_lbl}): {hora_ant:.1f} mm\n"
-        f"• Mes ({mes_act_lbl}): {mes_act:.1f} mm\n"
-        f"• Mes ({mes_ant_lbl}): {mes_ant:.1f} mm\n"
-        f"• Año hidrológico (actual): {ah_act:.1f} mm"
-    )
-    return msg
+        updated_str = updated_dt.strftime("%d/%m/%Y %H:%M")
 
-# =========================
-# DESCARGA PDFs
-# =========================
-def http_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0; +https://t.me/)",
-        "Accept": "*/*",
-    })
-    return s
+    # Orden pedido: Día, Hora, Mes, Año hidrológico
+    lines = [
+        f"📄 Lluvia diaria (actualizado: {updated_str})",
+        f"{place}:",
+        f"• Día ({day_label_actual}): {values['day_actual']:.1f} mm",
+        f"• Día ({day_label_prev}): {values['day_prev']:.1f} mm",
+        f"• Hora ({hour_label_actual}): {values['hour_actual']:.1f} mm",
+        f"• Hora ({hour_label_prev}): {values['hour_prev']:.1f} mm",
+        f"• Mes ({month_label_actual}): {values['month_actual']:.1f} mm",
+        f"• Mes ({month_label_prev}): {values['month_prev']:.1f} mm",
+        f"• Año hidrológico (actual): {values['hydro_actual']:.1f} mm",
+    ]
+    return "\n".join(lines)
 
-def download_pdf_direct(url: str) -> bytes:
-    s = http_session()
-    r = s.get(url, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    ctype = (r.headers.get("Content-Type") or "").lower()
-    if "pdf" not in ctype and not r.content.startswith(b"%PDF"):
-        # a veces devuelven HTML de error
-        raise RuntimeError(f"Descarga no parece PDF (Content-Type={ctype}) desde {url}")
-    return r.content
+def fetch_hoy(place: str) -> str:
+    if not PLUVO_URL:
+        raise RuntimeError("Falta PLUVO_URL en variables de entorno (URL de la tabla de pluviometría).")
 
-def download_pdf_from_informes(button_unique: str) -> bytes:
-    """
-    Simula el click de los botones de Informes.aspx.
-    button_unique debe ser el NAME del input (ej: 'ctl00$ContentPlaceHolder1$But_Llu7dpdf')
-    En ASP.NET, los image buttons envían también .x y .y
-    """
-    s = http_session()
-
-    # 1) GET para capturar VIEWSTATE/EVENTVALIDATION
-    r = s.get(INFORMES_URL, timeout=HTTP_TIMEOUT)
+    r = requests.get(PLUVO_URL, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     html = r.text
 
-    def get_hidden(name: str) -> str:
-        m = re.search(rf'name="{re.escape(name)}"\s+id="{re.escape(name)}"\s+value="([^"]*)"', html)
-        if not m:
-            # a veces el id no coincide exactamente; intentamos por name solo
-            m = re.search(rf'name="{re.escape(name)}"\s+value="([^"]*)"', html)
-        if not m:
-            raise RuntimeError(f"No encontré hidden field {name} en Informes.aspx")
-        return m.group(1)
+    updated_dt = parse_updated_datetime_from_html(html)
+    values = find_huelma_row_values_from_pluvio_page(html, place)
 
-    viewstate = get_hidden("__VIEWSTATE")
-    eventvalidation = get_hidden("__EVENTVALIDATION")
-    viewstategen = None
-    mgen = re.search(r'name="__VIEWSTATEGENERATOR"\s+value="([^"]*)"', html)
-    if mgen:
-        viewstategen = mgen.group(1)
+    return format_hoy_message(updated_dt, values, place)
 
-    # 2) POST simulando click image button
-    # Para image button, el nombre real que viaja es:
-    #   ctl00$ContentPlaceHolder1$But_Llu7dpdf.x
-    #   ctl00$ContentPlaceHolder1$But_Llu7dpdf.y
-    # y además se envían __VIEWSTATE, __EVENTVALIDATION
-    data = {
-        "__EVENTTARGET": "",
-        "__EVENTARGUMENT": "",
-        "__VIEWSTATE": viewstate,
-        "__EVENTVALIDATION": eventvalidation,
-    }
-    if viewstategen:
-        data["__VIEWSTATEGENERATOR"] = viewstategen
+# NOTA: /semanal lo dejo como “passthrough” si ya lo tienes funcionando con otro endpoint.
+# Aquí lo dejo simple: si tienes una URL directa para 7 días, ponla en WEEKLY_URL.
+WEEKLY_URL = os.environ.get("WEEKLY_URL", "").strip()
 
-    # coords del click (cualquier número vale)
-    data[f"{button_unique}.x"] = "10"
-    data[f"{button_unique}.y"] = "10"
+def fetch_semanal(place: str) -> str:
+    """
+    Opción A (recomendada): define WEEKLY_URL que devuelva texto/tabla ya con los 7 días.
+    Opción B: implementas aquí tu lógica actual (si me pegas tu app.py anterior, lo dejo idéntico).
+    """
+    if not WEEKLY_URL:
+        # fallback (para no romper): devolvemos un mensaje claro
+        return (
+            "📄 Lluvia semanal\n"
+            "Ahora mismo no tengo configurada la fuente para /semanal.\n"
+            "Pon WEEKLY_URL en Render (una URL que devuelva los datos de 7 días) "
+            "o pégame tu app.py actual y lo adapto conservando tu fuente."
+        )
 
-    rp = s.post(INFORMES_URL, data=data, timeout=HTTP_TIMEOUT, allow_redirects=True)
-    rp.raise_for_status()
+    r = requests.get(WEEKLY_URL, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    txt = r.text.strip()
 
-    # Si responde PDF directo:
-    ctype = (rp.headers.get("Content-Type") or "").lower()
-    if "pdf" in ctype or rp.content.startswith(b"%PDF"):
-        return rp.content
-
-    # A veces devuelve HTML con un redirect o algo; intentamos seguir si hay Location
-    # (requests ya sigue redirects, pero por si devuelven link dentro)
-    if "text/html" in ctype:
-        # intenta detectar un link .pdf
-        mm = re.search(r'href="([^"]+\.pdf)"', rp.text, flags=re.IGNORECASE)
-        if mm:
-            pdf_url = urljoin(INFORMES_URL, mm.group(1))
-            rr = s.get(pdf_url, timeout=HTTP_TIMEOUT)
-            rr.raise_for_status()
-            if rr.content.startswith(b"%PDF"):
-                return rr.content
-
-    raise RuntimeError("No pude obtener el PDF desde Informes.aspx (respuesta no-PDF).")
+    # Lo envolvemos bonito
+    updated_dt = datetime.now().strftime("%d/%m/%Y %H:%M")
+    return f"📄 Lluvia semanal (actualizado: {updated_dt})\n{place}:\n{txt}"
 
 # =========================
-# LOGICA DE COMANDOS
+# Commands
 # =========================
-def obtener_hoy() -> str:
-    pdf = download_pdf_direct(URL_HOY_PDF_DIRECTO)
-    text = pdf_text_from_bytes(pdf)
-    ts = extract_timestamp_from_text(text)
-    vals = find_station_line_numbers(text, ESTACION_HUELMA_KEY)
-
-    # Algunas veces la extracción mete valores extra al final; intentamos usar los 7 primeros
-    return format_hoy_message(ts, vals)
-
-def obtener_semanal() -> str:
-    # Botón PDF semanal según tu HTML:
-    # name="ctl00$ContentPlaceHolder1$But_Llu7dpdf"
-    pdf = download_pdf_from_informes("ctl00$ContentPlaceHolder1$But_Llu7dpdf")
-    text = pdf_text_from_bytes(pdf)
-    ts = extract_timestamp_from_text(text)
-    ts_txt = ts.strftime("%d/%m/%Y %H:%M") if ts else "no detectado"
-
-    # Para semanal, mantenemos el formato que ya te funcionaba.
-    # Aquí hacemos una extracción "típica": buscamos la fila de Huelma y sacamos los valores diarios.
-    # En tus capturas, ya lo tenías bien con bullets; lo replico:
-    vals = find_station_line_numbers(text, ESTACION_HUELMA_KEY)
-
-    # Heurística común: en semanal suele venir una lista de días + acumulados.
-    # Si tu implementación anterior era distinta, sustituye esta parte por tu parser antiguo.
-    #
-    # Intento: coger los últimos 7 valores "diarios" del final de la fila.
-    # Como no tenemos el layout exacto aquí, hacemos algo razonable:
-    # - Tomamos todos los floats y mostramos los 7 primeros como “días” si hay muchos.
-    # - y los dos últimos como acumulados mes/año si existen.
-    #
-    # Si tu PDF semanal es el clásico, esto suele cuadrar bien (pero si quieres 100% exacto,
-    # dime cuántas columnas trae la fila de Huelma en tu semanal y lo fijo a medida).
-    if len(vals) < 9:
-        raise RuntimeError(f"En semanal esperaba más valores; recibí {len(vals)}: {vals}")
-
-    # Normalmente: ... [d1..d7, mes, año_hidro] o similar
-    # Cogemos 7 primeros como días (o 7 últimos antes de acumulados)
-    # Intento robusto: asumimos que los 2 últimos son acumulados.
-    acumulado_mes = vals[-2]
-    acumulado_ah = vals[-1]
-    diarios = vals[:-2]
-
-    # si hay más de 7, nos quedamos con los últimos 7 (últimos días)
-    if len(diarios) > 7:
-        diarios_7 = diarios[-7:]
-    else:
-        diarios_7 = diarios
-
-    # Etiquetas de días: si el timestamp existe, asignamos fecha hacia atrás
-    lines = [f"📄 Lluvia semanal (actualizado: {ts_txt})", f"{ESTACION_HUELMA_KEY} – lluvia diaria (mm):"]
-    if ts:
-        d0 = ts.date()
-        # diario_7 corresponde a últimos 7 días terminando en d0 (asumido)
-        start = d0 - timedelta(days=len(diarios_7)-1)
-        for i, v in enumerate(diarios_7):
-            di = start + timedelta(days=i)
-            lines.append(f"• {di.strftime('%d/%m/%Y')}: {v:.1f} mm")
-    else:
-        for i, v in enumerate(diarios_7, start=1):
-            lines.append(f"• Día {i}: {v:.1f} mm")
-
-    lines.append("")
-    lines.append("Acumulados:")
-    lines.append(f"• Mes actual: {acumulado_mes:.1f} mm")
-    lines.append(f"• Año hidrológico: {acumulado_ah:.1f} mm")
-    return "\n".join(lines)
-
-# =========================
-# TELEGRAM HANDLERS
-# =========================
-def log_cmd(update: Update, cmd: str):
-    user = update.effective_user
-    db_log_usage(
-        user_id=user.id if user else None,
-        username=(user.username if user else None),
-        command=cmd,
-    )
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_cmd(update, "/start")
-    sub = db_get_subscription(update.effective_user.id)
-    sub_txt = "✅ activada (domingo 20:00)" if sub else "❌ desactivada"
-
+def cmd_start(chat_id: int):
     text = (
-        "Hola 👋\n"
-        "Comandos disponibles:\n"
-        "• /hoy → lluvia diaria (día/hora/mes/año hidrológico)\n"
+        "👋 ¡Hola! Soy tu bot de lluvia.\n\n"
+        "Comandos:\n"
+        "• /hoy → lluvia (día/hora/mes/año hidrológico)\n"
         "• /semanal → lluvia últimos 7 días\n"
-        "• /suscribir → recibe el resumen semanal (domingo 20:00)\n"
-        "• /desuscribir → cancela la suscripción\n"
-        "• /estado → estadísticas y estado\n\n"
-        f"Suscripción semanal: {sub_txt}"
+        "• /estado → info del bot y suscripción\n\n"
+        "Suscripción semanal: domingos a las 20:00."
     )
-    await update.message.reply_text(text)
+    tg_send_message(chat_id, text)
 
-async def hoy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_cmd(update, "/hoy")
-    try:
-        msg = obtener_hoy()
-        await update.message.reply_text(msg)
-    except Exception as e:
-        logger.exception("Error en /hoy")
-        await update.message.reply_text(f"Error en /hoy: {e}")
-
-async def semanal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_cmd(update, "/semanal")
-    try:
-        msg = obtener_semanal()
-        await update.message.reply_text(msg)
-    except Exception as e:
-        logger.exception("Error en /semanal")
-        await update.message.reply_text(f"Error en /semanal: {e}")
-
-async def suscribir_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_cmd(update, "/suscribir")
-    user = update.effective_user
-    db_set_subscription(user.id, user.username, True)
-    await update.message.reply_text("✅ Suscripción activada. Te enviaré el resumen semanal los domingos a las 20:00.")
-
-async def desuscribir_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_cmd(update, "/desuscribir")
-    user = update.effective_user
-    db_set_subscription(user.id, user.username, False)
-    await update.message.reply_text("✅ Suscripción desactivada.")
-
-async def estado_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log_cmd(update, "/estado")
-    total, by_cmd = db_get_usage_stats()
-    sub = db_get_subscription(update.effective_user.id)
-
+def cmd_estado(chat_id: int, username: str | None):
+    total, by_cmd = db_usage_summary()
     lines = [
-        "📊 Estado del bot",
-        f"• Usos totales: {total}",
-        "• Usos por comando:",
+        "📌 Estado del bot",
+        f"• Suscripción semanal: Domingo a las 20:00",
+        f"• Total usos registrados: {total}",
     ]
-    for row in by_cmd:
-        lines.append(f"  - {row['command']}: {row['c']}")
+    if is_admin(username):
+        lines.append("")
+        lines.append("📊 Usos por comando:")
+        for cmd, cnt in by_cmd[:10]:
+            lines.append(f"• {cmd}: {cnt}")
+    else:
+        lines.append("• (Detalle por comando solo visible para admin)")
 
-    lines.append("")
-    lines.append("🗓️ Suscripción semanal:")
-    lines.append("• Estado: " + ("✅ activada (domingo 20:00)" if sub else "❌ desactivada"))
+    tg_send_message(chat_id, "\n".join(lines))
 
-    # Nota útil sobre “se queda tonto”
-    lines.append("")
-    lines.append("ℹ️ Nota: si Render duerme el servicio por inactividad, el primer mensaje puede tardar (cold start).")
+def cmd_hoy(chat_id: int):
+    msg = fetch_hoy(TARGET_NAME)
+    tg_send_message(chat_id, msg)
 
-    await update.message.reply_text("\n".join(lines))
+def cmd_semanal(chat_id: int):
+    msg = fetch_semanal(TARGET_NAME)
+    tg_send_message(chat_id, msg)
 
 # =========================
-# TELEGRAM APP (async) + FLASK WEBHOOK
+# Flask routes
 # =========================
-tg_app: Application | None = None
-tg_loop: asyncio.AbstractEventLoop | None = None
+@app.route("/", methods=["GET"])
+def health():
+    return "ok", 200
 
-def run_telegram_loop():
-    global tg_app, tg_loop
-    tg_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(tg_loop)
-
-    tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
-    tg_app.add_handler(CommandHandler("start", start_cmd))
-    tg_app.add_handler(CommandHandler("hoy", hoy_cmd))
-    tg_app.add_handler(CommandHandler("semanal", semanal_cmd))
-    tg_app.add_handler(CommandHandler("suscribir", suscribir_cmd))
-    tg_app.add_handler(CommandHandler("desuscribir", desuscribir_cmd))
-    tg_app.add_handler(CommandHandler("estado", estado_cmd))
-
-    async def _init():
-        await tg_app.initialize()
-        await tg_app.start()
-        logger.info("Telegram Application iniciada.")
-
-    tg_loop.run_until_complete(_init())
-    tg_loop.run_forever()
-
-app = Flask(__name__)
-
-@app.get("/")
-def index():
-    return "OK"
-
-@app.post(WEBHOOK_PATH)
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    # si usas WEBHOOK_SECRET, esto protege el endpoint
-    if not tg_app or not tg_loop:
-        abort(503, "Bot not ready")
+    update = request.get_json(force=True, silent=False)
+
+    chat_id = get_chat_id(update)
+    if chat_id is None:
+        return "no chat", 200
+
+    text = get_message_text(update)
+    username = get_username(update)
+
+    # Normaliza: aceptar "hoy" "semanal" sin slash, pero la forma oficial es con /
+    norm = text.strip()
+    if norm.lower() in ("hoy", "semanal", "start", "estado"):
+        norm = "/" + norm.lower()
+
+    # Log de uso (solo si parece comando)
+    if norm.startswith("/"):
+        # comando puro (sin argumentos)
+        cmd = norm.split()[0].lower()
+        db_log_usage(chat_id, username, cmd)
 
     try:
-        data = request.get_json(force=True, silent=False)
-    except Exception:
-        abort(400, "Invalid JSON")
+        cmd = norm.split()[0].lower()
 
-    try:
-        update = Update.de_json(data, tg_app.bot)
-        fut = asyncio.run_coroutine_threadsafe(tg_app.process_update(update), tg_loop)
-        # No esperamos mucho: Telegram webhook tiene tiempos; respondemos rápido
-        _ = fut
+        if cmd == "/start":
+            cmd_start(chat_id)
+        elif cmd == "/hoy":
+            cmd_hoy(chat_id)
+        elif cmd in ("/semanal", "/siete"):
+            cmd_semanal(chat_id)
+        elif cmd == "/estado":
+            cmd_estado(chat_id, username)
+        else:
+            # no respondemos a TODO para no ser pesado, pero puedes activar un help
+            pass
+
     except Exception as e:
-        logger.exception("Error procesando update")
-        abort(500, str(e))
+        # Mensaje de error controlado
+        err = f"Error: {type(e).__name__}: {e}"
+        tg_send_message(chat_id, err)
 
-    return "OK"
+    return "ok", 200
 
 # =========================
-# MAIN
+# Run (local)
 # =========================
 if __name__ == "__main__":
     db_init()
-
-    t = threading.Thread(target=run_telegram_loop, daemon=True)
-    t.start()
-
-    # Render usa PORT
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
