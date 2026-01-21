@@ -14,9 +14,9 @@ from flask import Flask, request
 # =========================
 # Config
 # =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("Falta BOT_TOKEN en variables de entorno.")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Falta TELEGRAM_TOKEN en variables de entorno.")
 
 # URL donde está la tabla "INFORMACIÓN PLUVIOMÉTRICA" con HORA / DÍA / MES / AÑO HIDROLÓGICO
 PLUVO_URL = os.environ.get("PLUO_URL") or os.environ.get("PLUVO_URL", "").strip()
@@ -30,7 +30,7 @@ TARGET_NAME = os.environ.get("TARGET_NAME", "Huelma").strip()
 # Username admin (sin @). En tu caso: Rc_8_8
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "Rc_8_8").lstrip("@").strip()
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # SQLite para registrar usos
 DB_PATH = os.environ.get("DB_PATH", "bot_stats.sqlite3")
@@ -392,3 +392,4 @@ if __name__ == "__main__":
     db_init()
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
