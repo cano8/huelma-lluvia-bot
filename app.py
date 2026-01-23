@@ -138,20 +138,22 @@ def db_usage_summary():
 # =========================
 # Telegram helpers
 # =========================
-def tg_send_message(chat_id: int, text: str, reply_to_message_id: Optional[int] = None):
+def tg_send_message(chat_id: int, text: str, reply_to_message_id: int | None = None):
     payload = {
         "chat_id": chat_id,
         "text": text,
-        # IMPORTANT: evitamos parse_mode para no volver a romper /start con caracteres raros
-        "parse_mode": None,
         "disable_web_page_preview": True,
     }
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = reply_to_message_id
 
     r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=HTTP_TIMEOUT)
+
+    if not r.ok:
+        print("[ERROR] Telegram sendMessage falló:", r.status_code, r.text)
     r.raise_for_status()
     return r.json()
+
 
 def get_message_text(update: dict) -> str:
     msg = update.get("message") or update.get("edited_message") or {}
@@ -424,3 +426,4 @@ if __name__ == "__main__":
     db_init()
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
