@@ -5,6 +5,7 @@ import time
 import sqlite3
 from datetime import datetime, timedelta
 from html import escape as html_escape
+from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
@@ -43,12 +44,22 @@ app = Flask(__name__)
 # =========================
 # DB helpers
 # =========================
+def _db_connect():
+    # timeout para evitar locks raros en Render si hay concurrencia
+    return sqlite3.connect(DB_PATH, timeout=30)
+
 def db_init():
-    with sqlite3.connect(DB_PATH) as con:
+    """
+    Inicializa tablas y hace una migración simple si vienes de versiones antiguas.
+    Objetivo: que NUNCA pete el webhook por faltar una tabla.
+    """
+    with _db_connect() as con:
         cur = con.cursor()
+
+        # Tabla de eventos de uso (la que realmente usamos)
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS usage (
+            CREATE TABLE IF NOT EXISTS usage_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT NOT NULL,
                 chat_id TEXT NOT NULL,
@@ -57,6 +68,8 @@ def db_init():
             )
             """
         )
+
+        # Suscripciones
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS subs (
@@ -67,30 +80,65 @@ def db_init():
             )
             """
         )
+
+        # ---- Migración: si existe tabla antigua 'usage', migra a 'usage_events'
+        # (Esto cubre tu versión actual, y evita "no such table")
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='usage'")
+        if cur.fetchone():
+            # Crea tabla destino ya creada arriba; copiamos sin romper si hay columnas compatibles
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO usage_events (ts, chat_id, username, command)
+                    SELECT ts, chat_id, username, command FROM usage
+                    """
+                )
+                cur.execute("DROP TABLE usage")
+            except Exception:
+                # Si algo no cuadra, no tiramos el bot: lo dejamos como está.
+                pass
+
         con.commit()
 
-def db_log_usage(chat_id: str, username: str | None, command: str):
-    with sqlite3.connect(DB_PATH) as con:
-        cur = con.cursor()
-        cur.execute(
-            "INSERT INTO usage (ts, chat_id, username, command) VALUES (?, ?, ?, ?)",
-            (datetime.now().isoformat(timespec="seconds"), str(chat_id), username, command),
-        )
-        con.commit()
+def db_log_usage(chat_id: str, username: Optional[str], command: str):
+    """
+    Registro robusto: si falla SQLite, NO debe tumbar el webhook.
+    """
+    try:
+        with _db_connect() as con:
+            cur = con.cursor()
+            cur.execute(
+                "INSERT INTO usage_events (ts, chat_id, username, command) VALUES (?, ?, ?, ?)",
+                (datetime.utcnow().isoformat(timespec="seconds"), str(chat_id), username, command),
+            )
+            con.commit()
+    except Exception as e:
+        # No rompemos el bot por analytics.
+        # Si quieres ver esto en logs de Render:
+        print(f"[WARN] db_log_usage falló: {type(e).__name__}: {e}")
 
 def db_usage_summary():
-    with sqlite3.connect(DB_PATH) as con:
-        cur = con.cursor()
-        cur.execute("SELECT COUNT(*) FROM usage")
-        total = cur.fetchone()[0]
-        cur.execute("SELECT command, COUNT(*) FROM usage GROUP BY command ORDER BY COUNT(*) DESC")
-        by_cmd = cur.fetchall()
-        return total, by_cmd
+    """
+    Si falla por cualquier motivo, devolvemos valores seguros.
+    """
+    try:
+        with _db_connect() as con:
+            cur = con.cursor()
+            cur.execute("SELECT COUNT(*) FROM usage_events")
+            total = cur.fetchone()[0]
+            cur.execute(
+                "SELECT command, COUNT(*) FROM usage_events GROUP BY command ORDER BY COUNT(*) DESC"
+            )
+            by_cmd = cur.fetchall()
+            return total, by_cmd
+    except Exception as e:
+        print(f"[WARN] db_usage_summary falló: {type(e).__name__}: {e}")
+        return 0, []
 
 # =========================
 # Telegram helpers
 # =========================
-def tg_send_message(chat_id: int, text: str, reply_to_message_id: int | None = None):
+def tg_send_message(chat_id: int, text: str, reply_to_message_id: Optional[int] = None):
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -109,18 +157,17 @@ def get_message_text(update: dict) -> str:
     msg = update.get("message") or update.get("edited_message") or {}
     return (msg.get("text") or "").strip()
 
-def get_chat_id(update: dict) -> int | None:
+def get_chat_id(update: dict) -> Optional[int]:
     msg = update.get("message") or update.get("edited_message") or {}
     chat = msg.get("chat") or {}
     return chat.get("id")
 
-def get_username(update: dict) -> str | None:
+def get_username(update: dict) -> Optional[str]:
     msg = update.get("message") or update.get("edited_message") or {}
     frm = msg.get("from") or {}
-    u = frm.get("username")
-    return u
+    return frm.get("username")
 
-def is_admin(username: str | None) -> bool:
+def is_admin(username: Optional[str]) -> bool:
     if not username:
         return False
     return username.lstrip("@") == ADMIN_USERNAME
@@ -134,7 +181,7 @@ MONTHS_ES = {
     9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
 }
 
-def parse_updated_datetime_from_html(html: str) -> datetime | None:
+def parse_updated_datetime_from_html(html: str) -> Optional[datetime]:
     """
     Busca textos tipo:
     'Actualizados: 28/12/2025 12:52'
@@ -162,8 +209,6 @@ def find_huelma_row_values_from_pluvio_page(html: str, target_name: str) -> dict
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Estrategia robusta:
-    # 1) Buscamos cualquier tabla que contenga el texto del target.
     tables = soup.find_all("table")
     target_lower = target_name.strip().lower()
 
@@ -172,7 +217,6 @@ def find_huelma_row_values_from_pluvio_page(html: str, target_name: str) -> dict
         if target_lower not in text:
             continue
 
-        # Recorremos filas
         for tr in table.find_all("tr"):
             tds = tr.find_all(["td", "th"])
             if not tds:
@@ -181,15 +225,10 @@ def find_huelma_row_values_from_pluvio_page(html: str, target_name: str) -> dict
             if target_lower not in row_text:
                 continue
 
-            # Intentamos extraer números (mm) de la fila en orden
-            # Normalmente la fila tendrá: nombre + varios valores
-            # Sacamos todos los floats que aparezcan (con coma o punto)
             raw = " ".join(td.get_text(" ", strip=True) for td in tds)
             nums = re.findall(r"(-?\d+(?:[.,]\d+)?)", raw)
             nums = [float(x.replace(",", ".")) for x in nums]
 
-            # Si el sitio devuelve exactamente 7 valores (como en tu screenshot):
-            # Hora actual, Hora anterior, Día actual, Día anterior, Mes actual, Mes anterior, Año hidrológico actual
             if len(nums) >= 7:
                 return {
                     "hour_actual": nums[0],
@@ -201,14 +240,13 @@ def find_huelma_row_values_from_pluvio_page(html: str, target_name: str) -> dict
                     "hydro_actual": nums[6],
                 }
 
-            # Si cambia el layout, preferimos fallar claramente
             raise ValueError(
                 f"Fila encontrada para '{target_name}', pero no pude extraer 7 valores numéricos. Encontrados: {len(nums)}"
             )
 
     raise ValueError(f"No encontré una tabla/fila para '{target_name}' en la página de pluviometría.")
 
-def format_hoy_message(updated_dt: datetime | None, values: dict, place: str) -> str:
+def format_hoy_message(updated_dt: Optional[datetime], values: dict, place: str) -> str:
     """
     Formato final pedido:
     - primero día (actual y anterior): 28/12 y 27/12 (sin año)
@@ -216,7 +254,6 @@ def format_hoy_message(updated_dt: datetime | None, values: dict, place: str) ->
     - luego mes: 12-diciembre y 11-noviembre
     - año hidrológico: (actual) se queda como 'actual'
     """
-    # Si no hay updated_dt, no podemos mapear etiquetas por fecha/hora: ponemos fallback legible
     if updated_dt is None:
         day_label_actual = "día (actual)"
         day_label_prev = "día (anterior)"
@@ -226,7 +263,6 @@ def format_hoy_message(updated_dt: datetime | None, values: dict, place: str) ->
         month_label_prev = "mes (anterior)"
         updated_str = "no detectado"
     else:
-        # Etiquetas con el mapeo que quieres
         dt_prev_h = updated_dt - timedelta(hours=1)
         dt_prev_d = updated_dt - timedelta(days=1)
         dt_prev_m = updated_dt - relativedelta(months=1)
@@ -242,7 +278,6 @@ def format_hoy_message(updated_dt: datetime | None, values: dict, place: str) ->
 
         updated_str = updated_dt.strftime("%d/%m/%Y %H:%M")
 
-    # Orden pedido: Día, Hora, Mes, Año hidrológico
     lines = [
         f"📄 Lluvia diaria (actualizado: {updated_str})",
         f"{place}:",
@@ -269,17 +304,11 @@ def fetch_hoy(place: str) -> str:
 
     return format_hoy_message(updated_dt, values, place)
 
-# NOTA: /semanal lo dejo como “passthrough” si ya lo tienes funcionando con otro endpoint.
-# Aquí lo dejo simple: si tienes una URL directa para 7 días, ponla en WEEKLY_URL.
+# /semanal: passthrough por WEEKLY_URL
 WEEKLY_URL = os.environ.get("WEEKLY_URL", "").strip()
 
 def fetch_semanal(place: str) -> str:
-    """
-    Opción A (recomendada): define WEEKLY_URL que devuelva texto/tabla ya con los 7 días.
-    Opción B: implementas aquí tu lógica actual (si me pegas tu app.py anterior, lo dejo idéntico).
-    """
     if not WEEKLY_URL:
-        # fallback (para no romper): devolvemos un mensaje claro
         return (
             "📄 Lluvia semanal\n"
             "Ahora mismo no tengo configurada la fuente para /semanal.\n"
@@ -291,9 +320,8 @@ def fetch_semanal(place: str) -> str:
     r.raise_for_status()
     txt = r.text.strip()
 
-    # Lo envolvemos bonito
-    updated_dt = datetime.now().strftime("%d/%m/%Y %H:%M")
-    return f"📄 Lluvia semanal (actualizado: {updated_dt})\n{place}:\n{txt}"
+    updated_dt = datetime.utcnow().strftime("%d/%m/%Y %H:%M")
+    return f"📄 Lluvia semanal (actualizado: {updated_dt} UTC)\n{place}:\n{txt}"
 
 # =========================
 # Commands
@@ -309,11 +337,11 @@ def cmd_start(chat_id: int):
     )
     tg_send_message(chat_id, text)
 
-def cmd_estado(chat_id: int, username: str | None):
+def cmd_estado(chat_id: int, username: Optional[str]):
     total, by_cmd = db_usage_summary()
     lines = [
         "📌 Estado del bot",
-        f"• Suscripción semanal: Domingo a las 20:00",
+        "• Suscripción semanal: Domingo a las 20:00",
         f"• Total usos registrados: {total}",
     ]
     if is_admin(username):
@@ -343,6 +371,10 @@ def health():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    # Aseguramos DB init también en runtime (Render puede reiniciar instancias)
+    # Esto evita "no such table" aunque __main__ no se ejecute (con gunicorn).
+    db_init()
+
     update = request.get_json(force=True, silent=False)
 
     chat_id = get_chat_id(update)
@@ -352,16 +384,14 @@ def webhook():
     text = get_message_text(update)
     username = get_username(update)
 
-    # Normaliza: aceptar "hoy" "semanal" sin slash, pero la forma oficial es con /
     norm = text.strip()
     if norm.lower() in ("hoy", "semanal", "start", "estado"):
         norm = "/" + norm.lower()
 
     # Log de uso (solo si parece comando)
     if norm.startswith("/"):
-        # comando puro (sin argumentos)
         cmd = norm.split()[0].lower()
-        db_log_usage(chat_id, username, cmd)
+        db_log_usage(str(chat_id), username, cmd)
 
     try:
         cmd = norm.split()[0].lower()
@@ -375,13 +405,15 @@ def webhook():
         elif cmd == "/estado":
             cmd_estado(chat_id, username)
         else:
-            # no respondemos a TODO para no ser pesado, pero puedes activar un help
             pass
 
     except Exception as e:
-        # Mensaje de error controlado
         err = f"Error: {type(e).__name__}: {e}"
-        tg_send_message(chat_id, err)
+        try:
+            tg_send_message(chat_id, err)
+        except Exception:
+            # Si Telegram falla, al menos no reventamos el webhook
+            pass
 
     return "ok", 200
 
@@ -392,4 +424,3 @@ if __name__ == "__main__":
     db_init()
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
-
