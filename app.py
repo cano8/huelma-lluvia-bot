@@ -19,8 +19,9 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Falta TELEGRAM_TOKEN en variables de entorno.")
 
-# URL donde está la tabla "INFORMACIÓN PLUVIOMÉTRICA" con HORA / DÍA / MES / AÑO HIDROLÓGICO
-PLUVO_URL = os.environ.get("PLUO_URL") or os.environ.get("PLUVO_URL", "").strip()
+# URL donde está la tabla "INFORMACIÓN PLUVIOMÉTRICA"
+PLUVO_URL = os.environ.get("PLUVO_URL", "").strip()
+# (quitamos PLUO_URL porque era un typo)
 
 # URL de Informes.aspx (si quieres usarlo para semanal o enlaces)
 INFORMES_URL = os.environ.get("INFORMES_URL", "").strip()
@@ -38,6 +39,7 @@ DB_PATH = os.environ.get("DB_PATH", "bot_stats.sqlite3")
 
 # Timeout requests
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "20"))
+
 
 app = Flask(__name__)
 
@@ -426,4 +428,5 @@ if __name__ == "__main__":
     db_init()
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
 
