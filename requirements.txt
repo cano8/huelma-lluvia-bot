@@ -5,6 +5,8 @@ pdfplumber
 gunicorn
 beautifulsoup4
 python-dateutil
+pypdf
+
 
 
 
