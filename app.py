@@ -1,7 +1,7 @@
 import os
 import re
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 from flask import Flask, request
@@ -20,7 +20,7 @@ HTTP_TIMEOUT = 25
 PDF_HOY_URL = "https://www.chguadalquivir.es/saih/tmp/Lluvia_Hoy.pdf"
 PDF_7DIAS_URL = "https://www.chguadalquivir.es/saih/Informes/Lluvia7Dias.pdf"
 
-TARGET_NAME = "Huelma"  # solo esto
+TARGET_NAME = "Huelma"
 
 app = Flask(__name__)
 
@@ -47,12 +47,11 @@ def get_chat_id(update: dict) -> int | None:
     return chat.get("id")
 
 # =========================
-# PDF extraction
+# PDF helpers
 # =========================
 def fetch_pdf_text(url: str) -> str:
     r = requests.get(url, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
-
     reader = PdfReader(BytesIO(r.content))
     out = []
     for page in reader.pages:
@@ -67,23 +66,43 @@ def normalize_text(t: str) -> str:
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
-def extract_block_around_place(text: str, place: str, before: int = 700, after: int = 1500) -> str:
-    t = normalize_text(text)
-    m = re.search(rf"(?i)\b{re.escape(place)}\b", t)
-    if not m:
-        return t[:2000]
-    start = max(0, m.start() - before)
-    end = min(len(t), m.end() + after)
-    return t[start:end].strip()
-
 def to_float(s: str) -> float:
     return float(s.replace(",", "."))
 
+def parse_updated_datetime_from_pdf_text(text: str) -> datetime | None:
+    """
+    Busca una marca de actualización dentro del texto del PDF.
+    Típicos:
+      - "Actualizados: 25/01/2026 15:11"
+      - "Actualizado: 25/01/2026 15:11"
+      - "Actualización: 25/01/2026 15:11"
+    """
+    t = normalize_text(text)
+
+    m = re.search(
+        r"(?i)Actualizad[oa]s?\s*:\s*(\d{2}/\d{2}/\d{4})\s+(\d{1,2}:\d{2})",
+        t
+    )
+    if not m:
+        m = re.search(
+            r"(?i)Actualizaci[oó]n\s*:\s*(\d{2}/\d{2}/\d{4})\s+(\d{1,2}:\d{2})",
+            t
+        )
+    if not m:
+        return None
+
+    try:
+        return datetime.strptime(f"{m.group(1)} {m.group(2)}", "%d/%m/%Y %H:%M")
+    except ValueError:
+        return None
+
 # =========================
-# HOY parser (ya te funciona)
+# /HOY parsing
 # =========================
 def try_parse_hoy_row(text: str, place: str) -> dict | None:
     t = normalize_text(text)
+
+    # Capturamos 7 números tras la estación (hour_actual, hour_prev, day_actual, day_prev, month_actual, month_prev, hydro_actual)
     pattern = (
         rf"(?is)\b{re.escape(place)}\b.*?"
         r"(-?\d+(?:[.,]\d+)?).*?"
@@ -109,10 +128,10 @@ def try_parse_hoy_row(text: str, place: str) -> dict | None:
         "hydro_actual": nums[6],
     }
 
-def format_hoy(values: dict, place: str) -> str:
-    updated = datetime.now().strftime("%d/%m/%Y %H:%M")
+def format_hoy(values: dict, place: str, updated_dt: datetime | None) -> str:
+    updated_str = updated_dt.strftime("%d/%m/%Y %H:%M") if updated_dt else "no detectado"
     return (
-        f"📄 Lluvia HOY (consultado: {updated})\n"
+        f"📄 Lluvia HOY (actualizado: {updated_str})\n"
         f"{place}:\n"
         f"• Día (actual): {values['day_actual']:.1f} mm\n"
         f"• Día (anterior): {values['day_prev']:.1f} mm\n"
@@ -125,129 +144,116 @@ def format_hoy(values: dict, place: str) -> str:
 
 def build_hoy_message(place: str) -> str:
     text = fetch_pdf_text(PDF_HOY_URL)
+    updated_dt = parse_updated_datetime_from_pdf_text(text)
     parsed = try_parse_hoy_row(text, place)
-    if parsed:
-        return format_hoy(parsed, place)
-
-    block = extract_block_around_place(text, place)
-    updated = datetime.now().strftime("%d/%m/%Y %H:%M")
-    return (
-        f"📄 Lluvia HOY (consultado: {updated})\n"
-        f"No pude aislar automáticamente los 7 valores para {place}.\n"
-        f"Bloque detectado:\n\n{block}"
-    )
+    if not parsed:
+        return (
+            f"📄 Lluvia HOY\n"
+            f"No pude extraer la fila de {place} del PDF."
+        )
+    return format_hoy(parsed, place, updated_dt)
 
 # =========================
-# SEMANAL parser (nuevo)
+# /SEMANAL parsing (Huelma only)
 # =========================
-def parse_weekly_for_place(text: str, place: str) -> tuple[list[tuple[str, float]], float | None, float | None, float | None]:
+def find_line_for_place(text: str, place: str) -> str | None:
     """
-    Devuelve:
-      - pares (fecha_dd/mm, mm) para los días que aparezcan (en orden)
-      - total_semana, total_mes, total_hidrologico (si se detectan)
+    Busca una línea (o bloque lineal) que contenga la estación.
+    En tu caso sale como: "P63 Huelma (JA) ..."
     """
-    block = extract_block_around_place(text, place)
-    block_norm = normalize_text(block)
+    t = normalize_text(text)
 
-    # 1) Intentar detectar totales por etiquetas (si aparecen en el PDF)
-    total_semana = None
+    # A veces el extract_text “rompe” líneas raro; buscamos un segmento a partir de "Pxx Huelma"
+    m = re.search(rf"(?im)^(P\d+\s+{re.escape(place)}\b.*)$", t)
+    if m:
+        return m.group(1).strip()
+
+    # fallback: buscamos la primera aparición de "P.. Huelma" y recortamos hasta el final de línea o salto doble
+    m = re.search(rf"(?is)(P\d+\s+{re.escape(place)}\b.*?)(?:\n\n|\nP\d+\s+|\Z)", t)
+    if m:
+        return m.group(1).strip()
+
+    # fallback: buscar solo "Huelma" y recortar
+    m = re.search(rf"(?is)({re.escape(place)}\b.*?)(?:\n\n|\Z)", t)
+    if m:
+        return m.group(1).strip()
+
+    return None
+
+def parse_weekly_from_line(line: str) -> tuple[list[float], float | None, float | None, float | None]:
+    """
+    De una línea tipo:
+      P63 Huelma (JA) 19,1 5,2 29,3 7,5 5,2 0,0 0,0 66,3 98,9 325,2
+
+    Interpreta:
+      - 7 primeros: diarios (hoy, ayer, ...)
+      - luego (si están): total semana, total mes, total año hidrológico
+    """
+    nums = re.findall(r"-?\d+(?:[.,]\d+)?", line)
+    vals = [to_float(x) for x in nums]
+
+    if len(vals) < 7:
+        return [], None, None, None
+
+    daily = vals[:7]
+
+    total_sem = None
     total_mes = None
     total_hidro = None
 
-    # Variantes típicas (por si cambian acentos/espacios)
-    m = re.search(r"(?i)total\s*(?:semana|7\s*d[ií]as)\s*[: ]\s*(-?\d+(?:[.,]\d+)?)", block_norm)
-    if m:
-        total_semana = to_float(m.group(1))
+    # Caso típico (como tu ejemplo): 7 + 3 totales => 10 o más
+    # En tu captura salen 7 + 3 = 10, pero a veces hay algún campo extra, por eso pillamos “los últimos 3” tras los 7.
+    if len(vals) >= 10:
+        # asumimos: ... daily(7) ... total_sem total_mes total_hidro al final
+        total_sem = vals[-3]
+        total_mes = vals[-2]
+        total_hidro = vals[-1]
+    else:
+        # si no hay totales, al menos total semana lo calculamos
+        total_sem = sum(daily)
 
-    m = re.search(r"(?i)total\s*mes\s*[: ]\s*(-?\d+(?:[.,]\d+)?)", block_norm)
-    if m:
-        total_mes = to_float(m.group(1))
-
-    m = re.search(r"(?i)total\s*(?:año|ano)\s*hidrol[oó]gico\s*[: ]\s*(-?\d+(?:[.,]\d+)?)", block_norm)
-    if m:
-        total_hidro = to_float(m.group(1))
-
-    # 2) Extraer pares (dd/mm -> mm) recorriendo tokens tras "Huelma"
-    #    Esto funciona aunque el PDF venga “aplastado” en una línea.
-    idx = re.search(rf"(?i)\b{re.escape(place)}\b", block_norm)
-    if not idx:
-        return [], total_semana, total_mes, total_hidro
-
-    after = block_norm[idx.end():]
-
-    tokens = re.split(r"[\s]+", after.strip())
-    date_re = re.compile(r"^\d{2}/\d{2}$")
-    num_re = re.compile(r"^-?\d+(?:[.,]\d+)?$")
-
-    day_pairs: list[tuple[str, float]] = []
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i].strip()
-
-        if date_re.match(tok):
-            # buscar el siguiente token numérico
-            j = i + 1
-            while j < len(tokens) and not num_re.match(tokens[j].strip()):
-                j += 1
-            if j < len(tokens):
-                mm = to_float(tokens[j].strip())
-                day_pairs.append((tok, mm))
-                i = j + 1
-                continue
-
-        i += 1
-
-    # 3) Si no detectamos totales por etiqueta, intentar inferirlos:
-    #    Muchos PDFs ponen al final 3 columnas: semana/mes/año.
-    #    Si hay números extra después de las fechas, los pillamos así:
-    if total_semana is None or total_mes is None or total_hidro is None:
-        # extraemos todos los números del bloque tras la estación
-        nums_all = re.findall(r"-?\d+(?:[.,]\d+)?", after)
-        nums_all = [to_float(x) for x in nums_all]
-
-        # quitamos los ya usados en day_pairs (aprox) para no duplicar
-        used = [mm for _, mm in day_pairs]
-        remaining = []
-        for x in nums_all:
-            # comparación tolerante (por decimales)
-            if any(abs(x - u) < 1e-6 for u in used):
-                continue
-            remaining.append(x)
-
-        # si quedan al menos 3, asumimos que los 3 últimos son semana/mes/año hidro
-        if len(remaining) >= 3:
-            cand_sem, cand_mes, cand_hid = remaining[-3], remaining[-2], remaining[-1]
-            if total_semana is None:
-                total_semana = cand_sem
-            if total_mes is None:
-                total_mes = cand_mes
-            if total_hidro is None:
-                total_hidro = cand_hid
-
-    return day_pairs, total_semana, total_mes, total_hidro
+    return daily, total_sem, total_mes, total_hidro
 
 def build_semanal_message(place: str) -> str:
     text = fetch_pdf_text(PDF_7DIAS_URL)
-    day_pairs, total_semana, total_mes, total_hidro = parse_weekly_for_place(text, place)
+    updated_dt = parse_updated_datetime_from_pdf_text(text)
+    updated_str = updated_dt.strftime("%d/%m/%Y %H:%M") if updated_dt else "no detectado"
 
-    updated = datetime.now().strftime("%d/%m/%Y %H:%M")
-    lines = [f"📄 Lluvia 7 días (consultado: {updated})", f"{place}:"]
+    line = find_line_for_place(text, place)
+    if not line:
+        return (
+            f"📄 Lluvia 7 días (actualizado: {updated_str})\n"
+            f"{place}:\n"
+            f"No encontré la fila de {place} en el PDF."
+        )
 
-    if not day_pairs:
-        block = extract_block_around_place(text, place)
-        lines.append("No pude extraer bien la fila. Bloque detectado:")
-        lines.append(block)
-        return "\n".join(lines)
+    daily, total_sem, total_mes, total_hidro = parse_weekly_from_line(line)
+    if not daily:
+        return (
+            f"📄 Lluvia 7 días (actualizado: {updated_str})\n"
+            f"{place}:\n"
+            f"No pude extraer los valores diarios.\n"
+            f"Fila detectada:\n{line}"
+        )
 
-    # Primer día como "Hoy", el resto tal cual (24/01, 23/01, etc.)
-    hoy_date, hoy_mm = day_pairs[0]
-    lines.append(f"• Hoy ({hoy_date}): {hoy_mm:.1f} mm")
-    for d, mm in day_pairs[1:]:
-        lines.append(f"• {d}: {mm:.1f} mm")
+    # Generar fechas: hoy = fecha del PDF; si no existe, usamos fecha actual
+    base_date = (updated_dt.date() if updated_dt else datetime.now().date())
 
-    # Totales (si no salen, al menos no rompemos)
-    if total_semana is not None:
-        lines.append(f"• Total semana: {total_semana:.1f} mm")
+    # daily[0] = hoy, daily[1].. = días anteriores
+    lines = [f"📄 Lluvia 7 días (actualizado: {updated_str})", f"{place}:"]
+
+    # Hoy
+    hoy_label = base_date.strftime("%d/%m")
+    lines.append(f"• Hoy ({hoy_label}): {daily[0]:.1f} mm")
+
+    # Días anteriores
+    for i in range(1, len(daily)):
+        d = (base_date - timedelta(days=i)).strftime("%d/%m")
+        lines.append(f"• {d}: {daily[i]:.1f} mm")
+
+    # Totales
+    if total_sem is not None:
+        lines.append(f"• Total semana: {total_sem:.1f} mm")
     else:
         lines.append("• Total semana: (no detectado)")
 
@@ -264,13 +270,7 @@ def build_semanal_message(place: str) -> str:
     return "\n".join(lines)
 
 # =========================
-# Commands
-# =========================
-def cmd_start(chat_id: int):
-    tg_send_message(chat_id, "👋 Bot de lluvia (CHG)\n\nComandos:\n• /hoy\n• /semanal")
-
-# =========================
-# Flask routes
+# Routes
 # =========================
 @app.route("/", methods=["GET"])
 def health():
@@ -284,16 +284,15 @@ def webhook():
     if chat_id is None:
         return "no chat", 200
 
-    text = get_message_text(update)
-    norm = text.strip()
-    if norm.lower() in ("hoy", "semanal", "start"):
-        norm = "/" + norm.lower()
+    text = get_message_text(update).strip()
+    if text.lower() in ("hoy", "semanal", "start"):
+        text = "/" + text.lower()
 
     try:
-        cmd = norm.split()[0].lower()
+        cmd = text.split()[0].lower()
 
         if cmd == "/start":
-            cmd_start(chat_id)
+            tg_send_message(chat_id, "👋 Bot de lluvia (CHG)\n\nComandos:\n• /hoy\n• /semanal")
         elif cmd == "/hoy":
             tg_send_message(chat_id, build_hoy_message(TARGET_NAME))
         elif cmd in ("/semanal", "/siete"):
