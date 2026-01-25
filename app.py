@@ -5,14 +5,16 @@ from datetime import datetime
 
 import requests
 from flask import Flask, request
-from PyPDF2 import PdfReader
+
+# PDF reader (pypdf)
+from pypdf import PdfReader
 
 # =========================
 # Config (solo TELEGRAM_TOKEN)
 # =========================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Falta TELEGRAM_TOKEN en variables de entorno.")
+    raise RuntimeError("Falta TELEGRAM_TOKEN en variables de entorno (TELEGRAM_TOKEN).")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 HTTP_TIMEOUT = 25
@@ -20,7 +22,7 @@ HTTP_TIMEOUT = 25
 PDF_HOY_URL = "https://www.chguadalquivir.es/saih/tmp/Lluvia_Hoy.pdf"
 PDF_7DIAS_URL = "https://www.chguadalquivir.es/saih/Informes/Lluvia7Dias.pdf"
 
-TARGET_NAME = "Huelma"  # cámbialo si quieres
+TARGET_NAME = "Huelma"  # si quieres otro punto, cambia esto
 
 app = Flask(__name__)
 
@@ -47,55 +49,55 @@ def get_chat_id(update: dict) -> int | None:
     return chat.get("id")
 
 # =========================
-# PDF extraction helpers
+# PDF extraction
 # =========================
 def fetch_pdf_text(url: str) -> str:
     """
-    Lee el PDF directamente de la URL (en memoria) y extrae texto con PyPDF2.
+    Lee el PDF directamente de la URL (en memoria) y extrae texto con pypdf.
     """
     r = requests.get(url, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
 
     reader = PdfReader(BytesIO(r.content))
-    parts = []
+    out = []
     for page in reader.pages:
-        txt = page.extract_text() or ""
-        if txt.strip():
-            parts.append(txt)
-
-    return "\n".join(parts).strip()
+        t = page.extract_text() or ""
+        if t.strip():
+            out.append(t)
+    return "\n".join(out).strip()
 
 def normalize_text(t: str) -> str:
-    # Reduce ruido típico de extracción de PDF
     t = t.replace("\r", "\n")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
 def extract_block_around_place(text: str, place: str, before: int = 500, after: int = 900) -> str:
-    """
-    Devuelve un bloque alrededor del nombre del lugar. Sirve como fallback.
-    """
     t = normalize_text(text)
     m = re.search(rf"(?i)\b{re.escape(place)}\b", t)
     if not m:
-        return t[:1400]  # fallback para ver qué llega
+        return t[:1400]
     start = max(0, m.start() - before)
     end = min(len(t), m.end() + after)
     return t[start:end].strip()
 
 def try_parse_hoy_row(text: str, place: str) -> dict | None:
     """
-    Intenta extraer 7 valores numéricos típicos de la tabla de HOY:
+    Intenta extraer 7 valores numéricos típicos del PDF de HOY:
     Hora actual, Hora anterior, Día actual, Día anterior, Mes actual, Mes anterior, Año hidrológico
-    Devuelve dict o None si no lo consigue.
     """
     t = normalize_text(text)
 
-    # Buscamos una “línea” (o bloque) que contenga el lugar y números cerca.
-    # Como en PDFs los saltos de línea son raros, permitimos que haya \n entre medias.
-    # Capturamos 7 números con coma o punto.
-    pattern = rf"(?is)\b{re.escape(place)}\b.*?(-?\d+(?:[.,]\d+)?).*?(-?\d+(?:[.,]\d+)?).*?(-?\d+(?:[.,]\d+)?).*?(-?\d+(?:[.,]\d+)?).*?(-?\d+(?:[.,]\d+)?).*?(-?\d+(?:[.,]\d+)?).*?(-?\d+(?:[.,]\d+)?)"
+    pattern = (
+        rf"(?is)\b{re.escape(place)}\b.*?"
+        r"(-?\d+(?:[.,]\d+)?).*?"  # 1
+        r"(-?\d+(?:[.,]\d+)?).*?"  # 2
+        r"(-?\d+(?:[.,]\d+)?).*?"  # 3
+        r"(-?\d+(?:[.,]\d+)?).*?"  # 4
+        r"(-?\d+(?:[.,]\d+)?).*?"  # 5
+        r"(-?\d+(?:[.,]\d+)?).*?"  # 6
+        r"(-?\d+(?:[.,]\d+)?)"     # 7
+    )
     m = re.search(pattern, t)
     if not m:
         return None
@@ -114,7 +116,7 @@ def try_parse_hoy_row(text: str, place: str) -> dict | None:
 def format_hoy(values: dict, place: str) -> str:
     updated = datetime.now().strftime("%d/%m/%Y %H:%M")
     return (
-        f"📄 Lluvia HOY (CHG) (consultado: {updated})\n"
+        f"📄 Lluvia HOY (consultado: {updated})\n"
         f"{place}:\n"
         f"• Día (actual): {values['day_actual']:.1f} mm\n"
         f"• Día (anterior): {values['day_prev']:.1f} mm\n"
@@ -131,13 +133,12 @@ def build_hoy_message(place: str) -> str:
     if parsed:
         return format_hoy(parsed, place)
 
-    # Fallback: bloque alrededor para poder ajustar el parser si el PDF viene distinto
     block = extract_block_around_place(text, place)
     updated = datetime.now().strftime("%d/%m/%Y %H:%M")
     return (
-        f"📄 Lluvia HOY (CHG) (consultado: {updated})\n"
-        f"No pude aislar la fila numérica automáticamente. Te muestro el bloque encontrado:\n\n"
-        f"{block}"
+        f"📄 Lluvia HOY (consultado: {updated})\n"
+        f"No pude aislar automáticamente los 7 valores para {place}.\n"
+        f"Bloque detectado:\n\n{block}"
     )
 
 def build_semanal_message(place: str) -> str:
@@ -145,19 +146,15 @@ def build_semanal_message(place: str) -> str:
     block = extract_block_around_place(text, place, before=700, after=1200)
     updated = datetime.now().strftime("%d/%m/%Y %H:%M")
     return (
-        f"📄 Lluvia 7 días (CHG) (consultado: {updated})\n"
-        f"{place}:\n"
-        f"{block}"
+        f"📄 Lluvia 7 días (consultado: {updated})\n"
+        f"{place}:\n{block}"
     )
 
 # =========================
 # Commands
 # =========================
 def cmd_start(chat_id: int):
-    tg_send_message(
-        chat_id,
-        "👋 Bot de lluvia (CHG)\n\nComandos:\n• /hoy\n• /semanal"
-    )
+    tg_send_message(chat_id, "👋 Bot de lluvia (CHG)\n\nComandos:\n• /hoy\n• /semanal")
 
 # =========================
 # Flask routes
