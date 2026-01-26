@@ -1,7 +1,8 @@
 import os
 import re
+import time
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import requests
 from flask import Flask, request
@@ -45,9 +46,19 @@ def get_chat_id(update: dict) -> int | None:
 # =========================
 # PDF helpers
 # =========================
-def fetch_pdf_text(url: str) -> str:
-    r = requests.get(url, timeout=HTTP_TIMEOUT)
+def _requests_get_nocache(url: str) -> requests.Response:
+    # Rompe caché: query param + headers
+    bust = f"{url}{'&' if '?' in url else '?'}t={int(time.time())}"
+    headers = {
+        "Cache-Control": "no-cache, no-store, max-age=0",
+        "Pragma": "no-cache",
+    }
+    r = requests.get(bust, headers=headers, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
+    return r
+
+def fetch_pdf_text(url: str) -> str:
+    r = _requests_get_nocache(url)
     reader = PdfReader(BytesIO(r.content))
     out = []
     for page in reader.pages:
@@ -69,25 +80,34 @@ def parse_pdf_datetime_anywhere(text: str) -> datetime | None:
     """
     Extrae fecha/hora del PDF si aparece como:
       26/01/2026 18:13
-    Usamos la primera coincidencia que encontremos.
+      26/01/26 19:00
     """
     t = normalize_text(text)
-    m = re.search(r"\b(\d{2}/\d{2}/\d{4})\s+(\d{1,2}:\d{2})\b", t)
-    if not m:
-        return None
-    try:
-        return datetime.strptime(f"{m.group(1)} {m.group(2)}", "%d/%m/%Y %H:%M")
-    except ValueError:
-        return None
 
-# =========================
-# /HOY parsing
-# =========================
+    # primero año 4 dígitos
+    m = re.search(r"\b(\d{2}/\d{2}/\d{4})\s+(\d{1,2}:\d{2})\b", t)
+    if m:
+        try:
+            return datetime.strptime(f"{m.group(1)} {m.group(2)}", "%d/%m/%Y %H:%M")
+        except ValueError:
+            pass
+
+    # luego año 2 dígitos
+    m = re.search(r"\b(\d{2}/\d{2}/\d{2})\s+(\d{1,2}:\d{2})\b", t)
+    if m:
+        try:
+            return datetime.strptime(f"{m.group(1)} {m.group(2)}", "%d/%m/%y %H:%M")
+        except ValueError:
+            pass
+
+    return None
+
+# ==========================================================
+# /HOY (NO TOCAR: lo dejo como estaba cuando te funcionaba)
+# ==========================================================
 def try_parse_hoy_row(text: str, place: str) -> dict | None:
     t = normalize_text(text)
 
-    # Capturamos 7 números tras la estación:
-    # Hora actual, Hora anterior, Día actual, Día anterior, Mes actual, Mes anterior, Año hidrológico
     pattern = (
         rf"(?is)\b{re.escape(place)}\b.*?"
         r"(-?\d+(?:[.,]\d+)?).*?"
@@ -116,7 +136,7 @@ def try_parse_hoy_row(text: str, place: str) -> dict | None:
 def format_hoy(values: dict, place: str, updated_dt: datetime | None) -> str:
     updated_str = updated_dt.strftime("%d/%m/%Y %H:%M") if updated_dt else "no detectado"
     return (
-        f"📄 Lluvia HOY (actualizado: {updated_str})\n"
+        f"📄 Lluvia HOY (consultado: {updated_str})\n"
         f"{place}:\n"
         f"• Día (actual): {values['day_actual']:.1f} mm\n"
         f"• Día (anterior): {values['day_prev']:.1f} mm\n"
@@ -133,92 +153,127 @@ def build_hoy_message(place: str) -> str:
     parsed = try_parse_hoy_row(text, place)
     if not parsed:
         updated_str = updated_dt.strftime("%d/%m/%Y %H:%M") if updated_dt else "no detectado"
-        return f"📄 Lluvia HOY (actualizado: {updated_str})\nNo pude extraer la fila de {place} del PDF."
+        return f"📄 Lluvia HOY (consultado: {updated_str})\nNo pude extraer la fila de {place} del PDF."
     return format_hoy(parsed, place, updated_dt)
 
 # =========================
-# /SEMANAL parsing (Huelma only)
+# /SEMANAL (ARREGLADO)
 # =========================
-def find_line_for_place(text: str, place: str) -> str | None:
+def extract_weekly_header_dates(text: str, updated_dt: datetime | None) -> list[str]:
+    """
+    Saca fechas de columna tipo: 25/01/26 24/01/26 ... (7 fechas)
+    y construye la lista de etiquetas:
+      ["Día actual", "25/01/26", ..., "19/01/26"]
+    Si no se pueden sacar fechas, deja solo "Día actual" y luego D-1..D-7.
+    """
     t = normalize_text(text)
 
-    # Mejor caso: línea empieza por "Pxx Huelma ..."
-    m = re.search(rf"(?im)^(P\d+\s+{re.escape(place)}\b.*)$", t)
-    if m:
-        return m.group(1).strip()
+    # En el PDF suelen aparecer en línea como "25/01/26 24/01/26 ..."
+    dates = re.findall(r"\b\d{2}/\d{2}/\d{2}\b", t)
+    # Nos quedamos con el primer bloque de 7 fechas consecutivas si existe.
+    # (En la práctica, el PDF repite fechas pocas veces; esto suele funcionar)
+    uniq = []
+    for d in dates:
+        if not uniq or uniq[-1] != d:
+            uniq.append(d)
 
-    # Fallback: captura el bloque de esa fila hasta la siguiente estación / fin
-    m = re.search(rf"(?is)(P\d+\s+{re.escape(place)}\b.*?)(?:\n\n|\nP\d+\s+|\Z)", t)
-    if m:
-        return m.group(1).strip()
+    # buscamos un tramo de 7 que tenga pinta de cabecera:
+    # normalmente aparece justo después del título/tabla, así que usamos las primeras
+    header_7 = uniq[:7] if len(uniq) >= 7 else []
 
-    return None
+    labels = ["Día actual"]
+    if header_7:
+        labels.extend(header_7)
+        return labels
 
-def parse_weekly_from_line(line: str):
+    # fallback si el texto no trae fechas claras
+    if updated_dt:
+        # genera 7 días previos como yy
+        base = updated_dt
+        for i in range(1, 8):
+            d = (base.replace(hour=0, minute=0, second=0, microsecond=0) - (i * (base - base))).date()  # dummy safe
+        # si no tenemos forma robusta sin timedelta aquí, mejor no inventar:
+        pass
+
+    labels.extend([f"D-{i}" for i in range(1, 8)])
+    return labels
+
+def find_place_row_numbers(text: str, place: str) -> list[float] | None:
     """
-    FORMATO REAL (según indicas):
-      [DIA ACTUAL/HOY] [DÍA 1] [DÍA 2] [DÍA 3] [DÍA 4] [DÍA 5] [DÍA 6] [DÍA 7]
-      [TOTAL 7 DÍAS] [TOTAL MES] [TOTAL AÑO HIDROLÓGICO]
-
-    => 11 números en total
+    Busca la fila de 'Huelma' y extrae 11 números:
+      [día_actual] [d1]...[d7] [total_7d] [total_mes] [total_hidro]
+    Importante: en PDF a veces la fila parte en 2 líneas, así que:
+      - encuentra la línea que contiene 'Huelma'
+      - concatena líneas siguientes hasta reunir >= 11 números
     """
-    nums = re.findall(r"-?\d+(?:[.,]\d+)?", line)
-    vals = [to_float(x) for x in nums]
+    t = normalize_text(text)
+    lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
 
-    if len(vals) < 11:
+    # localiza índice de la línea con Huelma (ignorando may/min)
+    idx = None
+    for i, ln in enumerate(lines):
+        if re.search(rf"\b{re.escape(place)}\b", ln, flags=re.IGNORECASE):
+            idx = i
+            break
+    if idx is None:
         return None
 
-    daily_8 = vals[0:8]          # hoy + 7 días previos
-    total_7d = vals[8]
-    total_mes = vals[9]
-    total_hidro = vals[10]
+    block = lines[idx]
+    nums = re.findall(r"-?\d+(?:[.,]\d+)?", block)
 
-    return daily_8, total_7d, total_mes, total_hidro
+    j = idx + 1
+    while len(nums) < 11 and j < len(lines):
+        # si detectamos inicio de otra estación, paramos
+        # (en tus PDFs suelen ser códigos tipo E01/E02... o P63 etc)
+        if re.match(r"^[A-Z]\d{2}\b", lines[j]) or re.match(r"^P\d+\b", lines[j]):
+            break
+        block += " " + lines[j]
+        nums = re.findall(r"-?\d+(?:[.,]\d+)?", block)
+        j += 1
+
+    if len(nums) < 11:
+        return None
+
+    vals = [to_float(x) for x in nums[:11]]
+    return vals
 
 def build_semanal_message(place: str) -> str:
     text = fetch_pdf_text(PDF_7DIAS_URL)
     updated_dt = parse_pdf_datetime_anywhere(text)
     updated_str = updated_dt.strftime("%d/%m/%Y %H:%M") if updated_dt else "no detectado"
 
-    line = find_line_for_place(text, place)
-    if not line:
+    vals = find_place_row_numbers(text, place)
+    if not vals:
         return (
             f"📄 Lluvia 7 días (actualizado: {updated_str})\n"
             f"{place}:\n"
-            f"No encontré la fila de {place} en el PDF."
+            f"No pude localizar/interpretar la fila de {place} en el PDF."
         )
 
-    parsed = parse_weekly_from_line(line)
-    if not parsed:
-        return (
-            f"📄 Lluvia 7 días (actualizado: {updated_str})\n"
-            f"{place}:\n"
-            f"No pude interpretar la fila (esperaba 11 valores numéricos: hoy+7, total7d, mes, hidro).\n"
-            f"Fila detectada:\n{line}"
-        )
+    # vals: 0..7 (día actual + 7 fechas), 8 total7d, 9 total mes, 10 total hidro
+    daily = vals[0:8]
+    total_7d, total_mes, total_hidro = vals[8], vals[9], vals[10]
 
-    daily_8, total_7d, total_mes, total_hidro = parsed
+    # Etiquetas de fechas tomadas del PDF
+    labels = extract_weekly_header_dates(text, updated_dt)  # ["Día actual", "25/01/26"...]
+    # Asegura 8 etiquetas (día actual + 7)
+    if len(labels) < 8:
+        labels = (labels + [f"D-{i}" for i in range(1, 8)])[:8]
 
-    # Usamos la fecha del PDF como "hoy" (si no, fecha del sistema)
-    base_date = (updated_dt.date() if updated_dt else datetime.now().date())
+    out = [f"📄 Lluvia 7 días (actualizado: {updated_str})", f"{place}:"]
 
-    # Construimos bullets:
-    # • Hoy (dd/mm): X
-    # • dd/mm: ...
-    # ...
-    lines = [f"📄 Lluvia 7 días (actualizado: {updated_str})", f"{place}:"]
+    # HOY = Día actual
+    out.append(f"• Hoy ({labels[0]}): {daily[0]:.1f} mm")
 
-    # daily_8[0] es HOY, daily_8[1] es ayer, ... daily_8[7] hace 7 días
-    lines.append(f"• Hoy ({base_date.strftime('%d/%m')}): {daily_8[0]:.1f} mm")
+    # Los demás días: usan las fechas reales del PDF (labels[1..7])
     for i in range(1, 8):
-        d = (base_date - timedelta(days=i)).strftime("%d/%m")
-        lines.append(f"• {d}: {daily_8[i]:.1f} mm")
+        out.append(f"• {labels[i]}: {daily[i]:.1f} mm")
 
-    lines.append(f"• Total semana: {total_7d:.1f} mm")
-    lines.append(f"• Total mes: {total_mes:.1f} mm")
-    lines.append(f"• Total año hidrológico: {total_hidro:.1f} mm")
+    out.append(f"• Total semana: {total_7d:.1f} mm")
+    out.append(f"• Total mes: {total_mes:.1f} mm")
+    out.append(f"• Total año hidrológico: {total_hidro:.1f} mm")
 
-    return "\n".join(lines)
+    return "\n".join(out)
 
 # =========================
 # Routes
