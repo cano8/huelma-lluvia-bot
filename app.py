@@ -70,10 +70,6 @@ db_init()
 # Telegram helpers
 # =========================
 def tg_send_message(chat_id: int, text: str, reply_to_message_id: int | None = None) -> bool:
-    """
-    Devuelve True si Telegram aceptó el mensaje, False si falló.
-    Importante: NO enviamos parse_mode si no lo usamos (Telegram da 400 si va null).
-    """
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -85,7 +81,6 @@ def tg_send_message(chat_id: int, text: str, reply_to_message_id: int | None = N
     try:
         r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=HTTP_TIMEOUT)
         if not r.ok:
-            # esto te deja el motivo real en logs
             print(f"[TG ERROR] status={r.status_code} body={r.text}")
             return False
         return True
@@ -153,8 +148,18 @@ def extract_pdf_datetime(text: str) -> str | None:
     return None
 
 
+def extract_date_from_updated(updated_str: str | None) -> str | None:
+    """
+    Devuelve 'dd/mm/yy' o 'dd/mm/yyyy' (solo la parte de fecha) a partir del string de actualizado.
+    """
+    if not updated_str:
+        return None
+    m = re.search(r"(\d{2}/\d{2}/\d{2,4})", updated_str)
+    return m.group(1) if m else None
+
+
 # =========================
-# HOY (no tocar lógica; solo “actualizado” desde PDF)
+# HOY (NO TOCAR: funciona bien)
 # =========================
 def parse_hoy_values_from_text(text: str, place: str) -> dict:
     t = normalize_text(text)
@@ -213,15 +218,34 @@ def fetch_hoy(place: str) -> str:
 
 
 # =========================
-# SEMANAL (ignora P63 + mapeo correcto 11 valores)
+# SEMANAL (FIX: excluir la fecha del día actual del “actualizado”)
 # =========================
-def extract_week_dates_from_text(text: str) -> list[str]:
+def extract_week_dates_from_text(text: str, updated_str: str | None) -> list[str]:
+    """
+    Saca las fechas dd/mm/yy del PDF en orden, pero eliminando la fecha del "actualizado"
+    (que corresponde al día actual, y NO debe aparecer porque ya existe 'Día actual').
+    """
     t = normalize_text(text)
-    dates = re.findall(r"\b\d{2}/\d{2}/\d{2}\b", t)
+    all_dates = re.findall(r"\b\d{2}/\d{2}/\d{2}\b", t)
+
     uniq = []
-    for d in dates:
+    for d in all_dates:
         if d not in uniq:
             uniq.append(d)
+
+    updated_date = extract_date_from_updated(updated_str)
+
+    # Normalizamos updated_date a dd/mm/yy si viene como dd/mm/yyyy
+    updated_date_yy = None
+    if updated_date:
+        if len(updated_date) == 10:  # dd/mm/yyyy
+            updated_date_yy = updated_date[:6] + updated_date[-2:]  # dd/mm/yy
+        else:
+            updated_date_yy = updated_date  # dd/mm/yy
+
+    if updated_date_yy:
+        uniq = [d for d in uniq if d != updated_date_yy]
+
     return uniq[:7]
 
 
@@ -247,7 +271,7 @@ def find_place_row_11_values(text: str, place: str) -> list[float] | None:
             break
         block += " " + nxt
 
-    # FIX clave: elimina el P63 del comienzo para que NO se use “63” como dato
+    # elimina P63 / E## del inicio para no meterlo como número
     block = re.sub(r"^\s*(?:P\d+|[A-Z]\d{2})\b", "", block, flags=re.IGNORECASE).strip()
 
     nums = re.findall(r"-?\d+(?:[.,]\d+)?", block)
@@ -293,10 +317,12 @@ def fetch_semanal(place: str) -> str:
     pdf_bytes = download_pdf_bytes(URL_7DIAS)
     text = pdf_to_text(pdf_bytes)
     updated_str = extract_pdf_datetime(text)
-    dates7 = extract_week_dates_from_text(text)
+
+    dates7 = extract_week_dates_from_text(text, updated_str)
     vals11 = find_place_row_11_values(text, place)
     if not vals11:
         raise ValueError(f"No pude extraer la fila de '{place}' en el PDF semanal.")
+
     return format_semanal_message(updated_str, place, dates7, vals11)
 
 
@@ -359,7 +385,6 @@ def webhook():
             pass
 
     except Exception as e:
-        # intentamos avisar, pero sin romper el webhook si Telegram falla
         tg_send_message(chat_id, f"Error: {type(e).__name__}: {e}")
 
     return "ok", 200
