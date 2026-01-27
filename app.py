@@ -7,11 +7,11 @@ from io import BytesIO
 import requests
 from flask import Flask, request
 
-# PDF parsing (paquete recomendado)
 try:
     from pypdf import PdfReader
-except Exception:  # fallback por si lo tienes con otro nombre
+except Exception:
     from PyPDF2 import PdfReader  # type: ignore
+
 
 # =========================
 # Config (mínimo)
@@ -23,16 +23,15 @@ if not TELEGRAM_TOKEN:
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "20"))
 
-# URLs fijas (sin variables)
 URL_HOY = "https://www.chguadalquivir.es/saih/tmp/Lluvia_Hoy.pdf"
 URL_7DIAS = "https://www.chguadalquivir.es/saih/Informes/Lluvia7Dias.pdf"
 
 TARGET_NAME = "Huelma"
 
-# SQLite para usos
 DB_PATH = os.environ.get("DB_PATH", "bot_stats.sqlite3")
 
 app = Flask(__name__)
+
 
 # =========================
 # DB helpers
@@ -53,6 +52,7 @@ def db_init():
         )
         con.commit()
 
+
 def db_log_usage(chat_id: str, username: str | None, command: str):
     with sqlite3.connect(DB_PATH) as con:
         cur = con.cursor()
@@ -62,39 +62,54 @@ def db_log_usage(chat_id: str, username: str | None, command: str):
         )
         con.commit()
 
-# Inicializa DB al importar (importante en gunicorn)
+
 db_init()
+
 
 # =========================
 # Telegram helpers
 # =========================
-def tg_send_message(chat_id: int, text: str, reply_to_message_id: int | None = None):
+def tg_send_message(chat_id: int, text: str, reply_to_message_id: int | None = None) -> bool:
+    """
+    Devuelve True si Telegram aceptó el mensaje, False si falló.
+    Importante: NO enviamos parse_mode si no lo usamos (Telegram da 400 si va null).
+    """
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": None,
         "disable_web_page_preview": True,
     }
     if reply_to_message_id is not None:
         payload["reply_to_message_id"] = reply_to_message_id
 
-    r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=HTTP_TIMEOUT)
+        if not r.ok:
+            # esto te deja el motivo real en logs
+            print(f"[TG ERROR] status={r.status_code} body={r.text}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[TG EXC] {type(e).__name__}: {e}")
+        return False
+
 
 def get_message_text(update: dict) -> str:
     msg = update.get("message") or update.get("edited_message") or {}
     return (msg.get("text") or "").strip()
+
 
 def get_chat_id(update: dict) -> int | None:
     msg = update.get("message") or update.get("edited_message") or {}
     chat = msg.get("chat") or {}
     return chat.get("id")
 
+
 def get_username(update: dict) -> str | None:
     msg = update.get("message") or update.get("edited_message") or {}
     frm = msg.get("from") or {}
     return frm.get("username")
+
 
 # =========================
 # PDF helpers
@@ -104,31 +119,27 @@ def download_pdf_bytes(url: str) -> bytes:
     r.raise_for_status()
     return r.content
 
+
 def pdf_to_text(pdf_bytes: bytes) -> str:
     reader = PdfReader(BytesIO(pdf_bytes))
     parts = []
     for page in reader.pages:
-        txt = page.extract_text() or ""
-        parts.append(txt)
+        parts.append(page.extract_text() or "")
     return "\n".join(parts)
 
+
 def normalize_text(s: str) -> str:
-    # normaliza espacios y separadores
     s = s.replace("\r", "\n")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{2,}", "\n", s)
     return s.strip()
 
+
 def to_float(x: str) -> float:
     return float(x.replace(",", "."))
 
+
 def extract_pdf_datetime(text: str) -> str | None:
-    """
-    Extrae fecha/hora que aparece en el PDF.
-    Ejemplos típicos:
-      26/01/2026 18:13
-      26/01/26 19:00
-    """
     t = normalize_text(text)
 
     m = re.search(r"\b(\d{2}/\d{2}/\d{4})\s+(\d{1,2}:\d{2})\b", t)
@@ -137,34 +148,22 @@ def extract_pdf_datetime(text: str) -> str | None:
 
     m = re.search(r"\b(\d{2}/\d{2}/\d{2})\s+(\d{1,2}:\d{2})\b", t)
     if m:
-        # deja tal cual (formato corto) porque así sale en el PDF de 7 días
         return f"{m.group(1)} {m.group(2)}"
 
     return None
 
-# =========================
-# HOY (lo dejamos como lo tenías conceptualmente)
-# =========================
-MONTHS_ES = {
-    1: "enero", 2: "febrero", 3: "marzo", 4: "abril",
-    5: "mayo", 6: "junio", 7: "julio", 8: "agosto",
-    9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
-}
 
+# =========================
+# HOY (no tocar lógica; solo “actualizado” desde PDF)
+# =========================
 def parse_hoy_values_from_text(text: str, place: str) -> dict:
-    """
-    En Lluvia_Hoy.pdf, la fila suele tener (para el punto):
-    HoraActual HoraAnterior DiaActual DiaAnterior MesActual MesAnterior AnioHidroActual
-    """
     t = normalize_text(text)
     lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
     target = place.lower()
 
-    # busca línea con el punto
     block = None
     for i, ln in enumerate(lines):
         if target in ln.lower():
-            # concatena con la siguiente por si parte la fila
             block = ln
             if i + 1 < len(lines):
                 block += " " + lines[i + 1]
@@ -172,7 +171,6 @@ def parse_hoy_values_from_text(text: str, place: str) -> dict:
     if not block:
         raise ValueError(f"No encontré '{place}' en el PDF de hoy.")
 
-    # quita prefijos tipo P63/E01 al principio si aparecen
     block = re.sub(r"^\s*(?:P\d+|[A-Z]\d{2})\b", "", block, flags=re.IGNORECASE).strip()
 
     nums = re.findall(r"-?\d+(?:[.,]\d+)?", block)
@@ -190,6 +188,7 @@ def parse_hoy_values_from_text(text: str, place: str) -> dict:
         "hydro_actual": vals[6],
     }
 
+
 def format_hoy_message(updated_str: str | None, values: dict, place: str) -> str:
     up = updated_str or "no detectado"
     return "\n".join([
@@ -204,6 +203,7 @@ def format_hoy_message(updated_str: str | None, values: dict, place: str) -> str
         f"• Año hidrológico (actual): {values['hydro_actual']:.1f} mm",
     ])
 
+
 def fetch_hoy(place: str) -> str:
     pdf_bytes = download_pdf_bytes(URL_HOY)
     text = pdf_to_text(pdf_bytes)
@@ -211,35 +211,21 @@ def fetch_hoy(place: str) -> str:
     values = parse_hoy_values_from_text(text, place)
     return format_hoy_message(updated_str, values, place)
 
+
 # =========================
-# SEMANAL (arreglado: ignora P63 y mapea bien columnas)
+# SEMANAL (ignora P63 + mapeo correcto 11 valores)
 # =========================
 def extract_week_dates_from_text(text: str) -> list[str]:
-    """
-    Saca las fechas de cabecera (25/01/26 24/01/26 ... 19/01/26).
-    Devuelve lista en orden de aparición.
-    """
     t = normalize_text(text)
-
-    # en el PDF aparecen varias fechas; nos quedamos con el bloque de 7 días
     dates = re.findall(r"\b\d{2}/\d{2}/\d{2}\b", t)
-
-    # típico: aparecen justo en la cabecera y en el cuerpo; filtramos quedándonos con una secuencia única
     uniq = []
     for d in dates:
         if d not in uniq:
             uniq.append(d)
-
-    # normalmente necesitamos 7 fechas (día1..día7). Si hay más, cogemos las primeras 7 “razonables”.
-    # En ese PDF suele ser: 25/01/26 24/01/26 ... 19/01/26 (7 items)
     return uniq[:7]
 
+
 def find_place_row_11_values(text: str, place: str) -> list[float] | None:
-    """
-    Encuentra la fila del punto y extrae exactamente 11 valores:
-      [DIA_ACTUAL] [D1] [D2] [D3] [D4] [D5] [D6] [D7] [TOTAL_7D] [TOTAL_MES] [TOTAL_HIDRO]
-    FIX: ignora el código P63/E01 para no comerse el 63/01.
-    """
     t = normalize_text(text)
     lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
     target = place.lower()
@@ -252,18 +238,16 @@ def find_place_row_11_values(text: str, place: str) -> list[float] | None:
     if idx is None:
         return None
 
-    # Concatena varias líneas por si la fila se parte
     block = lines[idx]
     for k in range(1, 4):
         if idx + k >= len(lines):
             break
         nxt = lines[idx + k]
-        # si parece inicio de otra estación, corta
         if re.match(r"^(?:[A-Z]\d{2}|P\d+)\b", nxt, flags=re.IGNORECASE):
             break
         block += " " + nxt
 
-    # FIX: elimina prefijo estación SOLO al inicio (P63/E01)
+    # FIX clave: elimina el P63 del comienzo para que NO se use “63” como dato
     block = re.sub(r"^\s*(?:P\d+|[A-Z]\d{2})\b", "", block, flags=re.IGNORECASE).strip()
 
     nums = re.findall(r"-?\d+(?:[.,]\d+)?", block)
@@ -273,10 +257,11 @@ def find_place_row_11_values(text: str, place: str) -> list[float] | None:
     vals = [to_float(x) for x in nums[:11]]
     return vals
 
+
 def format_semanal_message(updated_str: str | None, place: str, dates7: list[str], vals11: list[float]) -> str:
-    # vals11 = [dia_actual, d1..d7, total7, total_mes, total_hidro]
+    # [DIA ACTUAL] [D1..D7] [TOTAL 7] [TOTAL MES] [TOTAL HIDRO]
     dia_actual = vals11[0]
-    days = vals11[1:8]          # 7 valores
+    days = vals11[1:8]
     total7 = vals11[8]
     total_mes = vals11[9]
     total_hidro = vals11[10]
@@ -289,8 +274,6 @@ def format_semanal_message(updated_str: str | None, place: str, dates7: list[str
         f"• Hoy (Día actual): {dia_actual:.1f} mm",
     ]
 
-    # fechas7 corresponde a las columnas 25/01/26..19/01/26 (D1..D7)
-    # Si no logramos fechas, mostramos “Día 1..7”
     if len(dates7) == 7:
         for d, v in zip(dates7, days):
             lines.append(f"• {d}: {v:.1f} mm")
@@ -305,38 +288,37 @@ def format_semanal_message(updated_str: str | None, place: str, dates7: list[str
     ]
     return "\n".join(lines)
 
+
 def fetch_semanal(place: str) -> str:
     pdf_bytes = download_pdf_bytes(URL_7DIAS)
     text = pdf_to_text(pdf_bytes)
-
     updated_str = extract_pdf_datetime(text)
     dates7 = extract_week_dates_from_text(text)
-
     vals11 = find_place_row_11_values(text, place)
     if not vals11:
         raise ValueError(f"No pude extraer la fila de '{place}' en el PDF semanal.")
-
     return format_semanal_message(updated_str, place, dates7, vals11)
+
 
 # =========================
 # Commands
 # =========================
 def cmd_start(chat_id: int):
-    text = (
-        "👋 ¡Hola! Soy tu bot de lluvia.\n\n"
-        "Comandos:\n"
-        "• /hoy → lluvia (día/hora/mes/año hidrológico)\n"
-        "• /semanal → lluvia últimos 7 días (solo Huelma)\n"
+    tg_send_message(
+        chat_id,
+        "👋 Bot de lluvia listo.\n\n"
+        "• /hoy\n"
+        "• /semanal\n"
     )
-    tg_send_message(chat_id, text)
+
 
 def cmd_hoy(chat_id: int):
-    msg = fetch_hoy(TARGET_NAME)
-    tg_send_message(chat_id, msg)
+    tg_send_message(chat_id, fetch_hoy(TARGET_NAME))
+
 
 def cmd_semanal(chat_id: int):
-    msg = fetch_semanal(TARGET_NAME)
-    tg_send_message(chat_id, msg)
+    tg_send_message(chat_id, fetch_semanal(TARGET_NAME))
+
 
 # =========================
 # Flask routes
@@ -344,6 +326,7 @@ def cmd_semanal(chat_id: int):
 @app.route("/", methods=["GET"])
 def health():
     return "ok", 200
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -366,7 +349,6 @@ def webhook():
 
     try:
         cmd = norm.split()[0].lower()
-
         if cmd == "/start":
             cmd_start(chat_id)
         elif cmd == "/hoy":
@@ -377,11 +359,12 @@ def webhook():
             pass
 
     except Exception as e:
+        # intentamos avisar, pero sin romper el webhook si Telegram falla
         tg_send_message(chat_id, f"Error: {type(e).__name__}: {e}")
 
     return "ok", 200
 
-# Nota: en Render NO hace falta app.run; gunicorn importa app:app
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
